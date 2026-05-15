@@ -6,6 +6,7 @@ from urllib.parse import quote_plus
 import polars as pl
 import streamlit as st
 
+import crm_push
 import skip_trace
 
 st.set_page_config(
@@ -30,10 +31,6 @@ FLAG_DESCRIPTIONS = {
     "trust_estate_name": "Owner is a trust or estate (inheritance / probate hint)",
     "multi_property_owner": "Same owner has multiple parcels",
 }
-
-ENTITY_HINTS = (" LLC", " L L C", " INC", " CORP", " LTD", " LP", " L P",
-                " PA", " PLLC", " HOLDINGS", " PROPERTIES", " INVESTMENTS",
-                " TRUST", " ESTATE", " VENTURES", " PARTNERS", " GROUP")
 
 CRM_COLUMNS = [
     "parcel_id", "owner_name", "owner_mailing", "situs_address", "situs_city",
@@ -158,6 +155,35 @@ with st.sidebar:
             "Pre-1980 build + 25+ yr held",
             help="Deferred-maintenance proxy",
         )
+        entity_only = st.checkbox(
+            "LLC / entity owners only",
+            help="Owner is an LLC, trust, or other entity (not an individual).",
+        )
+
+    st.markdown("---")
+    st.markdown("### CRM push")
+    default_token = ""
+    default_url = crm_push.DEFAULT_BASE_URL
+    try:
+        default_token = st.secrets["crm"]["capture_token"]
+    except Exception:
+        pass
+    try:
+        default_url = st.secrets["crm"]["base_url"]
+    except Exception:
+        pass
+
+    crm_base_url = st.text_input("CRM base URL", value=default_url, key="crm_base_url")
+    crm_token = st.text_input(
+        "CAPTURE_TOKEN",
+        value=default_token,
+        type="password",
+        help="Bearer token for /api/capture. Set crm.capture_token in Streamlit secrets to persist.",
+        key="crm_token",
+    )
+    crm_ready = bool(crm_token.strip())
+    if not crm_ready:
+        st.caption("Paste a token above to enable push-to-CRM buttons.")
 
 
 def apply_filters(df: pl.DataFrame) -> pl.DataFrame:
@@ -190,6 +216,8 @@ def apply_filters(df: pl.DataFrame) -> pl.DataFrame:
             & (pl.col("year_built") < 1980)
             & (pl.col("last_sale_year").fill_null(0) < CURRENT_YEAR - 25)
         )
+    if entity_only:
+        out = out.filter(pl.col("is_entity"))
     return out
 
 
@@ -234,8 +262,9 @@ kpi_html = f"""
 st.markdown(kpi_html, unsafe_allow_html=True)
 
 # ── Tabs ───────────────────────────────────────────────────────────────────────
-t_leads, t_owners, t_addr, t_lookup, t_about = st.tabs(
-    ["Scored leads", "Multi-property owners", "Address clusters", "Parcel lookup", "About"]
+t_leads, t_owners, t_addr, t_lookup, t_analytics, t_about = st.tabs(
+    ["Scored leads", "Multi-property owners", "Address clusters",
+     "Parcel lookup", "Analytics", "About"]
 )
 
 LEAD_COL_CONFIG = {
@@ -276,25 +305,57 @@ with t_leads:
             column_config=LEAD_COL_CONFIG,
         )
 
-        d1, d2 = st.columns(2)
+        d1, d2, d3 = st.columns(3)
         d1.download_button(
-            "⬇️ Download filtered (full columns)",
+            "⬇️ Download filtered CSV",
             display.write_csv(),
             file_name="motivated_sellers_filtered.csv",
             mime="text/csv",
             use_container_width=True,
         )
-        crm_ready = (
+        crm_ready_csv = (
             filtered.select([c for c in CRM_COLUMNS if c in filtered.columns])
             .sort("score", descending=True)
         )
         d2.download_button(
             "⬇️ CRM-ready CSV",
-            crm_ready.write_csv(),
+            crm_ready_csv.write_csv(),
             file_name="acquisitions_crm_import.csv",
             mime="text/csv",
             use_container_width=True,
         )
+        push_n = min(filtered.height, 200)
+        push_clicked = d3.button(
+            f"🚀 Push top {push_n} to CRM",
+            disabled=not crm_ready or filtered.is_empty(),
+            help="POST the highest-score filtered rows to the CRM /api/capture endpoint."
+                 " Capped at 200/click for safety.",
+            use_container_width=True,
+        )
+        if push_clicked and crm_ready:
+            rows = filtered.sort("score", descending=True).head(push_n).to_dicts()
+            progress = st.progress(0, text=f"pushing 0/{push_n} …")
+            status_box = st.empty()
+
+            def cb(done: int, total: int, last: dict) -> None:
+                progress.progress(done / total, text=f"pushing {done}/{total} …")
+
+            stats = crm_push.push_batch(rows, crm_base_url, crm_token, progress_cb=cb)
+            progress.empty()
+            if stats["failed"] == 0:
+                status_box.success(
+                    f"✅ Pushed {stats['total']} — created {stats['created']}, "
+                    f"updated {stats['other_ok']}."
+                )
+            else:
+                status_box.warning(
+                    f"Pushed {stats['total']} — created {stats['created']}, "
+                    f"updated {stats['other_ok']}, **failed {stats['failed']}**."
+                )
+                if stats["errors"]:
+                    with st.expander("First few errors"):
+                        for e in stats["errors"]:
+                            st.code(e)
 
 with t_owners:
     st.markdown(f"##### Owners holding multiple parcels")
@@ -377,13 +438,6 @@ with t_addr:
         file_name="address_clusters.csv",
         mime="text/csv",
     )
-
-
-def looks_like_entity(name: str) -> bool:
-    if not name:
-        return False
-    upper = " " + name.upper() + " "
-    return any(hint in upper for hint in ENTITY_HINTS)
 
 
 def render_link_pill(label: str, url: str) -> str:
@@ -470,7 +524,27 @@ with t_lookup:
             st.markdown("---")
             st.markdown("##### 🕵️ Skip trace")
 
-            is_entity = looks_like_entity(row["owner_name"])
+            is_entity = bool(row.get("is_entity"))
+
+            # Per-parcel push to CRM
+            push_col, _ = st.columns([2, 5])
+            push_one_clicked = push_col.button(
+                "🚀 Push this lead to CRM",
+                disabled=not crm_ready,
+                help="POST this single parcel to /api/capture",
+                use_container_width=True,
+                key=f"push_one_{row['parcel_id']}",
+            )
+            if push_one_clicked and crm_ready:
+                with st.spinner("Pushing to CRM…"):
+                    res = crm_push.push_one(dict(row), crm_base_url, crm_token)
+                if res.get("ok"):
+                    pid = res.get("propertyId") or res.get("leadId") or ""
+                    st.success(f"✅ pushed (HTTP {res.get('status')}) — id: {pid}")
+                else:
+                    st.error(
+                        f"❌ failed: {res.get('error') or res.get('details') or res.get('status')}"
+                    )
 
             colA, colB = st.columns(2)
             run_sunbiz = colA.button(
@@ -574,6 +648,94 @@ with t_lookup:
                 unsafe_allow_html=True,
             )
 
+with t_analytics:
+    st.markdown("##### Lead distribution")
+    st.caption(
+        f"Charts reflect your current sidebar filters — {filtered.height:,} of "
+        f"{leads.height:,} total leads."
+    )
+
+    if filtered.is_empty():
+        st.info("No leads match the current filters.")
+    else:
+        col_left, col_right = st.columns(2)
+
+        with col_left:
+            st.markdown("**Score breakdown**")
+            score_dist = (
+                filtered.group_by("score").agg(pl.len().alias("count"))
+                .sort("score", descending=True)
+                .to_pandas().set_index("score")
+            )
+            st.bar_chart(score_dist, horizontal=True, color="#9ee29e")
+
+            st.markdown("**Top counties by lead count**")
+            top_counties = (
+                filtered.group_by("county_name").agg(pl.len().alias("count"))
+                .sort("count", descending=True).head(15)
+                .to_pandas().set_index("county_name")
+            )
+            st.bar_chart(top_counties, color="#9ee29e")
+
+        with col_right:
+            st.markdown("**Flag frequency**")
+            flag_counts: dict[str, int] = {f: 0 for f in FLAG_DESCRIPTIONS}
+            for s in filtered["flags"].to_list():
+                for f in (s or "").split(","):
+                    if f in flag_counts:
+                        flag_counts[f] += 1
+            flag_df = pl.DataFrame(
+                {"flag": list(flag_counts.keys()),
+                 "count": list(flag_counts.values())}
+            ).sort("count", descending=True).to_pandas().set_index("flag")
+            st.bar_chart(flag_df, horizontal=True, color="#9ee29e")
+
+            st.markdown("**Just-value distribution**")
+            jv_buckets = (
+                filtered.with_columns(
+                    pl.when(pl.col("just_value") < 100_000).then(pl.lit("< $100K"))
+                    .when(pl.col("just_value") < 200_000).then(pl.lit("$100–200K"))
+                    .when(pl.col("just_value") < 350_000).then(pl.lit("$200–350K"))
+                    .when(pl.col("just_value") < 500_000).then(pl.lit("$350–500K"))
+                    .when(pl.col("just_value") < 750_000).then(pl.lit("$500–750K"))
+                    .when(pl.col("just_value") < 1_000_000).then(pl.lit("$750K–1M"))
+                    .otherwise(pl.lit("$1M+"))
+                    .alias("bucket")
+                )
+                .group_by("bucket").agg(pl.len().alias("count"))
+                .to_pandas().set_index("bucket")
+                .reindex(["< $100K", "$100–200K", "$200–350K", "$350–500K",
+                          "$500–750K", "$750K–1M", "$1M+"])
+            )
+            st.bar_chart(jv_buckets, color="#9ee29e")
+
+        st.markdown("---")
+        st.markdown("**Top 25 owner entities by parcel count (in filtered set)**")
+        top_owners = (
+            filtered.filter(pl.col("is_entity"))
+            .group_by("owner_norm")
+            .agg(
+                pl.len().alias("parcels"),
+                pl.col("just_value").sum().alias("total_value"),
+                pl.col("county_name").n_unique().alias("counties"),
+                pl.col("owner_name").first().alias("example_owner"),
+            )
+            .sort("parcels", descending=True).head(25)
+        )
+        st.dataframe(
+            top_owners,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "example_owner": st.column_config.TextColumn("Owner", width="large"),
+                "parcels": st.column_config.NumberColumn("Parcels", format="%d"),
+                "total_value": st.column_config.NumberColumn("Total value", format="$%d"),
+                "counties": st.column_config.NumberColumn("Counties", format="%d"),
+                "owner_norm": st.column_config.TextColumn("Normalized", width="medium"),
+            },
+        )
+
+
 with t_about:
     st.markdown(
         """
@@ -623,5 +785,28 @@ parcels scoring ≥ 75 are shipped in the data file (~41k leads across six count
   FastPeopleSearch, BeenVerified, county appraiser, and Google Maps.
 
 Both live lookups cache for 24 hours so re-clicking is instant.
+
+### Push to CRM
+
+Paste your `CAPTURE_TOKEN` in the sidebar to enable two push paths:
+
+- **Push top N to CRM** on Scored Leads — sends the highest-score filtered rows
+  to `/api/capture`, capped at 200 per click. Idempotent (upserts by parcelId).
+- **Push this lead to CRM** on Parcel Lookup — single row.
+
+Set `crm.capture_token` in Streamlit secrets to skip the manual paste.
+
+### Owner normalization
+
+Owner names are normalized (uppercase, drop periods, &→AND, collapse spaces)
+the same way the CRM does it. That means "ABC LLC", "ABC, LLC", and
+"ABC L.L.C." count as one entity for `multi_property_owner`, and the CRM won't
+create duplicate leads when you push the same owner twice.
+
+### Analytics tab
+
+Charts reflect whatever the sidebar is filtering to. Score and flag
+distributions, top counties, just-value buckets, and a top-25-owner-entities
+leaderboard for the current filter set.
 """
     )

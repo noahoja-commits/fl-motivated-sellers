@@ -45,6 +45,36 @@ LONG_HELD_THRESHOLD = CURRENT_YEAR - 25
 TRUST_ESTATE_RE = r"\b(TRUST|TRUSTEE|ESTATE|FAMILY|HEIRS|LIVING\s+TR|REV\s+TR|TR\s+OF)\b"
 PO_BOX_RE = r"^\s*(P\.?\s*O\.?\s*BOX|POST\s+OFFICE\s+BOX|PO\s+BOX)\b"
 
+# Entity-detection keywords. Mirrors crm/lib/owner-normalize.ts so
+# multi_property_owner counts here match what the CRM thinks.
+ENTITY_KEYWORDS_RE = (
+    r"\b(LLC|LLP|LP|INC|INCORPORATED|CORP|CORPORATION|LTD|LIMITED|CO|"
+    r"COMPANY|PA|PLLC|TRUST|TRUSTEE|TRUSTEES|ESTATE|FOUNDATION|"
+    r"ASSOCIATION|PARTNERSHIP|PARTNERS|PROPERTIES|INVESTMENTS|HOLDINGS|"
+    r"VENTURES|GROUP|REALTY|DEVELOPMENT|DEVELOPERS|BUILDERS|MANAGEMENT|"
+    r"ENTERPRISES|CAPITAL|CHURCH|MINISTRIES|TEMPLE|SCHOOL|ACADEMY|"
+    r"UNIVERSITY|COLLEGE|HOSPITAL|DEPARTMENT|AUTHORITY|DISTRICT|BANK|"
+    r"MORTGAGE|INSURANCE|HOA|COA|CITY OF|COUNTY OF|TOWN OF|STATE OF)\b"
+)
+
+
+def name_norm_expr(col: str) -> pl.Expr:
+    """Normalize an owner name with pure polars expressions (streaming-safe).
+
+    Matches crm/lib/owner-normalize.ts behavior:
+      uppercase → strip periods → punct→space → &→AND → collapse spaces → trim.
+    """
+    return (
+        pl.col(col)
+        .fill_null("")
+        .str.to_uppercase()
+        .str.replace_all(r"\.", "")
+        .str.replace_all(r"[,/\\]", " ")
+        .str.replace_all(r"&", " AND ")
+        .str.replace_all(r"\s+", " ")
+        .str.strip_chars()
+    )
+
 
 def discover_parquets(input_dir: Path, county_codes: list[int]) -> list[Path]:
     files = []
@@ -76,6 +106,7 @@ def score(df: pl.DataFrame) -> pl.DataFrame:
     trust_estate = own_name_up.str.contains(TRUST_ESTATE_RE)
 
     df = df.with_columns(
+        name_norm_expr("OWN_NAME").alias("owner_norm"),
         out_of_state.alias("f_out_of_state"),
         out_of_zip.alias("f_out_of_zip"),
         po_box.alias("f_po_box"),
@@ -83,9 +114,15 @@ def score(df: pl.DataFrame) -> pl.DataFrame:
         trust_estate.alias("f_trust_estate_name"),
     )
 
-    # multi_property_owner flag: same OWN_NAME appears >=2 times within county
-    multi = df.group_by(["CO_NO", "OWN_NAME"]).len().rename({"len": "owner_parcel_count"})
-    df = df.join(multi, on=["CO_NO", "OWN_NAME"], how="left").with_columns(
+    # Entity vs individual: lightweight heuristic — any entity keyword present.
+    df = df.with_columns(
+        pl.col("owner_norm").str.contains(ENTITY_KEYWORDS_RE).alias("is_entity")
+    )
+
+    # multi_property_owner: group by NORMALIZED owner name so "ABC LLC",
+    # "ABC, LLC", "ABC L.L.C." all collapse to one entity.
+    multi = df.group_by(["CO_NO", "owner_norm"]).len().rename({"len": "owner_parcel_count"})
+    df = df.join(multi, on=["CO_NO", "owner_norm"], how="left").with_columns(
         (pl.col("owner_parcel_count") >= 2).alias("f_multi_property_owner")
     )
 
@@ -153,8 +190,13 @@ def shape_output(df: pl.DataFrame) -> pl.DataFrame:
         pl.col("PHY_CITY").alias("situs_city"),
         pl.col("PHY_ZIPCD").alias("situs_zip"),
         pl.col("OWN_NAME").alias("owner_name"),
+        pl.col("owner_norm"),
+        pl.col("is_entity"),
         own_mailing.alias("owner_mailing"),
+        pl.col("OWN_ADDR1").alias("owner_mailing_street"),
+        pl.col("OWN_CITY").alias("owner_mailing_city"),
         pl.col("OWN_STATE").alias("owner_state"),
+        pl.col("OWN_ZIPCD").alias("owner_mailing_zip"),
         pl.col("JV").alias("just_value"),
         pl.col("SALE_YR1").alias("last_sale_year"),
         pl.col("SALE_PRC1").alias("last_sale_price"),
