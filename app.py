@@ -16,7 +16,7 @@ st.set_page_config(
 )
 
 DATA_DIR = Path(__file__).parent / "data"
-LEADS_CSV = DATA_DIR / "leads.csv"
+LEADS_PATH = DATA_DIR / "leads.parquet"
 BY_OWNER = DATA_DIR / "by_owner.parquet"
 BY_ADDR = DATA_DIR / "by_address.parquet"
 
@@ -44,7 +44,7 @@ CRM_COLUMNS = [
 
 @st.cache_data
 def load_leads() -> pl.DataFrame:
-    return pl.read_csv(LEADS_CSV)
+    return pl.read_parquet(LEADS_PATH)
 
 
 @st.cache_data

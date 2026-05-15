@@ -194,7 +194,8 @@ def main() -> None:
     p.add_argument(
         "--output",
         type=Path,
-        default=Path(__file__).parent / "data" / "leads.csv",
+        default=Path(__file__).parent / "data" / "leads.parquet",
+        help="Output path. Writes parquet if .parquet, else CSV.",
     )
     p.add_argument("--min-score", type=int, default=75)
     args = p.parse_args()
@@ -257,7 +258,10 @@ def main() -> None:
     print(f"  combined output: {out.height:,} rows")
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    out.write_csv(args.output)
+    if args.output.suffix.lower() == ".parquet":
+        out.write_parquet(args.output, compression="zstd")
+    else:
+        out.write_csv(args.output)
     size_mb = args.output.stat().st_size / 1_000_000
     print(f"wrote {args.output} ({size_mb:.1f} MB, {out.height:,} leads)")
 
