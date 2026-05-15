@@ -1,3 +1,13 @@
+---
+title: FL Motivated Sellers
+emoji: 🏚️
+colorFrom: green
+colorTo: gray
+sdk: streamlit
+app_file: streamlit_app.py
+pinned: false
+---
+
 # FL Motivated Sellers Dashboard
 
 Streamlit dashboard over Florida's statewide parcel (NAL) data, surfacing
