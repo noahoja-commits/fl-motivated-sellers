@@ -29,7 +29,10 @@ FLAG_DESCRIPTIONS = {
     "po_box": "Mailing addr is a PO Box (often investor / absentee)",
     "long_held_25y": "Owned 25+ years (high equity, often tired landlord)",
     "trust_estate_name": "Owner is a trust or estate (inheritance / probate hint)",
-    "multi_property_owner": "Same owner has multiple parcels",
+    "multi_property_owner": "Same normalized owner has multiple parcels",
+    "bank_trustee": "Owner is a bank, REO, or mortgage trustee (foreclosed assets)",
+    "sale_anomaly": "Last sale was <50% or >150% of just value (distressed buy or peak overpayer)",
+    "high_equity_proxy": "Bought for <40% of current value, or no sale + 25+ yr old building",
 }
 
 CRM_COLUMNS = [

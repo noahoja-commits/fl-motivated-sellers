@@ -44,6 +44,15 @@ LONG_HELD_THRESHOLD = CURRENT_YEAR - 25
 
 TRUST_ESTATE_RE = r"\b(TRUST|TRUSTEE|ESTATE|FAMILY|HEIRS|LIVING\s+TR|REV\s+TR|TR\s+OF)\b"
 PO_BOX_RE = r"^\s*(P\.?\s*O\.?\s*BOX|POST\s+OFFICE\s+BOX|PO\s+BOX)\b"
+BANK_TRUSTEE_RE = (
+    r"\b(BANK|REO|N\s*A|NATIONAL\s+ASSOCIATION|FANNIE\s+MAE|FREDDIE\s+MAC|"
+    r"FEDERAL\s+NATIONAL|FEDERAL\s+HOME|HUD|VA\s+SECRETARY|MERS|"
+    r"DEUTSCHE\s+BANK|WELLS\s+FARGO|US\s+BANK|JPMORGAN|CITIBANK|"
+    r"BANK\s+OF\s+AMERICA|MORTGAGE\s+TRUST)\b"
+)
+SALE_LOW_RATIO = 0.50    # last_sale_price < 50% of JV = bought distressed / inherited / fire sale
+SALE_HIGH_RATIO = 1.50   # last_sale_price > 150% of JV = peak overpayer
+HIGH_EQUITY_RATIO = 0.40 # last_sale_price < 40% of JV when sale exists = strong equity proxy
 
 # Entity-detection keywords. Mirrors crm/lib/owner-normalize.ts so
 # multi_property_owner counts here match what the CRM thinks.
@@ -104,6 +113,20 @@ def score(df: pl.DataFrame) -> pl.DataFrame:
         (sale_yr == 0) & (act_yr > 0) & (act_yr <= LONG_HELD_THRESHOLD)
     )
     trust_estate = own_name_up.str.contains(TRUST_ESTATE_RE)
+    bank_trustee = own_name_up.str.contains(BANK_TRUSTEE_RE)
+
+    sale_price = pl.col("SALE_PRC1").fill_null(0)
+    jv = pl.col("JV").fill_null(0)
+    has_sale = (sale_price > 0) & (jv > 0)
+    sale_low = has_sale & (sale_price < jv * SALE_LOW_RATIO)
+    sale_high = has_sale & (sale_price > jv * SALE_HIGH_RATIO) & (sale_yr >= 2019)
+    sale_anomaly = sale_low | sale_high
+    high_equity = (
+        has_sale & (sale_price < jv * HIGH_EQUITY_RATIO)
+    ) | (
+        # No recorded sale + old building + decent value = inherited high-equity
+        (sale_price == 0) & (act_yr > 0) & (act_yr <= LONG_HELD_THRESHOLD) & (jv >= 100_000)
+    )
 
     df = df.with_columns(
         name_norm_expr("OWN_NAME").alias("owner_norm"),
@@ -112,6 +135,9 @@ def score(df: pl.DataFrame) -> pl.DataFrame:
         po_box.alias("f_po_box"),
         long_held.alias("f_long_held_25y"),
         trust_estate.alias("f_trust_estate_name"),
+        bank_trustee.alias("f_bank_trustee"),
+        sale_anomaly.alias("f_sale_anomaly"),
+        high_equity.alias("f_high_equity_proxy"),
     )
 
     # Entity vs individual: lightweight heuristic — any entity keyword present.
@@ -154,6 +180,9 @@ def score(df: pl.DataFrame) -> pl.DataFrame:
         (pl.col("f_long_held_25y"), "long_held_25y"),
         (pl.col("f_trust_estate_name"), "trust_estate_name"),
         (pl.col("f_multi_property_owner"), "multi_property_owner"),
+        (pl.col("f_bank_trustee"), "bank_trustee"),
+        (pl.col("f_sale_anomaly"), "sale_anomaly"),
+        (pl.col("f_high_equity_proxy"), "high_equity_proxy"),
     ]
     flag_exprs = [pl.when(cond).then(pl.lit(name)).otherwise(pl.lit("")) for cond, name in flag_pairs]
     df = df.with_columns(
