@@ -36,14 +36,7 @@ COUNTIES: dict[int, str] = {
     76: "Walton", 77: "Washington",
 }
 
-DEFAULT_COUNTIES = [
-    15, 16, 18, 19, 21, 23, 26, 37, 39, 45,
-    46, 51, 52, 58, 59, 60, 61, 62, 63, 65,
-    66, 68, 70, 74,
-]
-# Brevard, Broward, Charlotte, Citrus, Collier, Dade, Duval, Hernando,
-# Hillsborough, Lake, Lee, Manatee, Marion, Orange, Osceola, Palm Beach,
-# Pasco, Pinellas, Polk, Saint Johns, Saint Lucie, Sarasota, Sumter, Volusia
+DEFAULT_COUNTIES = list(range(11, 78))  # All 67 FL counties (11-77 inclusive)
 RESIDENTIAL_DOR = {"001", "002", "004", "005", "006", "008"}
 MULTIFAMILY_DOR = {"003", "008", "009"}
 CURRENT_YEAR = 2026
