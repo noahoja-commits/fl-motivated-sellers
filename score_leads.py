@@ -36,7 +36,7 @@ COUNTIES: dict[int, str] = {
     76: "Walton", 77: "Washington",
 }
 
-DEFAULT_COUNTIES = [37, 51, 61, 62, 63, 68]  # Hernando, Manatee, Pasco, Pinellas, Polk, Sarasota
+DEFAULT_COUNTIES = [19, 37, 39, 51, 61, 62, 63, 68]  # Citrus, Hernando, Hillsborough, Manatee, Pasco, Pinellas, Polk, Sarasota
 RESIDENTIAL_DOR = {"001", "002", "004", "005", "006", "008"}
 MULTIFAMILY_DOR = {"003", "008", "009"}
 CURRENT_YEAR = 2026
