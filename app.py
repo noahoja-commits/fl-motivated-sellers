@@ -119,6 +119,50 @@ leads = load_leads()
 by_owner = load_by_owner()
 by_addr = load_by_address()
 
+# ── Hydrate filter state from URL query params (once per session) ─────────────
+qp = st.query_params
+
+
+def _qp_csv(key: str) -> list[str]:
+    raw = qp.get(key)
+    return [x for x in raw.split(",") if x] if raw else []
+
+
+def _qp_int(key: str, default: int) -> int:
+    try:
+        return int(qp.get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _qp_bool(key: str) -> bool:
+    return str(qp.get(key, "")).lower() in {"1", "true", "yes"}
+
+
+_VMIN_DEFAULT = int(leads["just_value"].min() or 0)
+_VMAX_DEFAULT = int(leads["just_value"].max() or 0)
+
+_STATE_DEFAULTS = {
+    "f_counties": _qp_csv("counties"),
+    "f_value_range": (_qp_int("vmin", _VMIN_DEFAULT), _qp_int("vmax", _VMAX_DEFAULT)),
+    "f_min_score": _qp_int("min_score", 75),
+    "f_multifamily": _qp_bool("multifamily"),
+    "f_recent_buyer": _qp_bool("recent_buyer"),
+    "f_pre_1980": _qp_bool("pre_1980"),
+    "f_entity_only": _qp_bool("entity_only"),
+}
+for k, v in _STATE_DEFAULTS.items():
+    st.session_state.setdefault(k, v)
+
+# Star/shortlist state — session-only, exportable as CSV
+st.session_state.setdefault("starred_parcels", set())
+
+_require_from_url = set(_qp_csv("require"))
+_exclude_from_url = set(_qp_csv("exclude"))
+for flag in FLAG_DESCRIPTIONS:
+    st.session_state.setdefault(f"req_{flag}", flag in _require_from_url)
+    st.session_state.setdefault(f"exc_{flag}", flag in _exclude_from_url)
+
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### Filters")
@@ -126,18 +170,14 @@ with st.sidebar:
     with st.expander("Counties & value", expanded=True):
         counties_all = sorted(leads["county_name"].unique().to_list())
         selected_counties = st.multiselect(
-            "Counties", counties_all, default=[],
-            placeholder="All counties",
+            "Counties", counties_all, placeholder="All counties", key="f_counties",
         )
-        min_value = int(leads["just_value"].min() or 0)
-        max_value = int(leads["just_value"].max() or 0)
         value_range = st.slider(
             "Just value ($)",
-            min_value=min_value, max_value=max_value,
-            value=(min_value, max_value), step=10_000,
-            format="$%d",
+            min_value=_VMIN_DEFAULT, max_value=_VMAX_DEFAULT,
+            step=10_000, format="$%d", key="f_value_range",
         )
-        min_score = st.slider("Min score", 0, 100, 75, step=25)
+        min_score = st.slider("Min score", 0, 100, step=25, key="f_min_score")
 
     with st.expander("Flag requirements"):
         st.caption("Require ALL checked flags")
@@ -153,23 +193,60 @@ with st.sidebar:
 
     with st.expander("Property characteristics"):
         multifamily_only = st.checkbox(
-            "Multifamily only",
+            "Multifamily only", key="f_multifamily",
             help="Residential units ≥ 2 (DOR codes 003 / 008 / 009 also included)",
         )
         recent_buyer_stranded = st.checkbox(
-            "Recent buyer underwater",
+            "Recent buyer underwater", key="f_recent_buyer",
             help="Bought in last 4 yrs at ≥ current just value",
         )
         pre_1980 = st.checkbox(
-            "Pre-1980 build + 25+ yr held",
+            "Pre-1980 build + 25+ yr held", key="f_pre_1980",
             help="Deferred-maintenance proxy",
         )
         entity_only = st.checkbox(
-            "LLC / entity owners only",
+            "LLC / entity owners only", key="f_entity_only",
             help="Owner is an LLC, trust, or other entity (not an individual).",
         )
 
     st.markdown("---")
+
+    # ── Shareable filter URL ──────────────────────────────────────────────────
+    def _current_qp() -> dict[str, str]:
+        out: dict[str, str] = {}
+        if st.session_state["f_counties"]:
+            out["counties"] = ",".join(st.session_state["f_counties"])
+        if st.session_state["f_min_score"] != 75:
+            out["min_score"] = str(st.session_state["f_min_score"])
+        vmin, vmax = st.session_state["f_value_range"]
+        if vmin != _VMIN_DEFAULT:
+            out["vmin"] = str(vmin)
+        if vmax != _VMAX_DEFAULT:
+            out["vmax"] = str(vmax)
+        req = [f for f in FLAG_DESCRIPTIONS if st.session_state.get(f"req_{f}")]
+        if req:
+            out["require"] = ",".join(req)
+        exc = [f for f in FLAG_DESCRIPTIONS if st.session_state.get(f"exc_{f}")]
+        if exc:
+            out["exclude"] = ",".join(exc)
+        for sk, qk in [
+            ("f_multifamily", "multifamily"), ("f_recent_buyer", "recent_buyer"),
+            ("f_pre_1980", "pre_1980"), ("f_entity_only", "entity_only"),
+        ]:
+            if st.session_state.get(sk):
+                out[qk] = "1"
+        return out
+
+    _now_qp = _current_qp()
+    with st.expander("📎 Share this filter"):
+        if not _now_qp:
+            st.caption("No filters set. Pick something above and the URL will appear here.")
+        else:
+            from urllib.parse import urlencode
+            qs = urlencode(_now_qp)
+            st.caption("Append this to the dashboard URL — opens with the same filters preloaded:")
+            st.code(f"?{qs}", language=None)
+
     st.markdown("### CRM push")
     default_token = ""
     default_url = crm_push.DEFAULT_BASE_URL
@@ -271,9 +348,12 @@ kpi_html = f"""
 st.markdown(kpi_html, unsafe_allow_html=True)
 
 # ── Tabs ───────────────────────────────────────────────────────────────────────
-t_leads, t_owners, t_addr, t_lookup, t_analytics, t_about = st.tabs(
+_starred_count = len(st.session_state["starred_parcels"])
+_star_tab_label = f"⭐ Starred ({_starred_count})" if _starred_count else "⭐ Starred"
+
+t_leads, t_owners, t_addr, t_lookup, t_starred, t_analytics, t_about = st.tabs(
     ["Scored leads", "Multi-property owners", "Address clusters",
-     "Parcel lookup", "Analytics", "About"]
+     "Parcel lookup", _star_tab_label, "Analytics", "About"]
 )
 
 LEAD_COL_CONFIG = {
@@ -648,8 +728,24 @@ with t_lookup:
                     )
                 st.markdown("</div>", unsafe_allow_html=True)
 
-            # Per-parcel push to CRM
-            push_col, _ = st.columns([2, 5])
+            # Star + push to CRM
+            star_col, push_col, _ = st.columns([1, 2, 4])
+            parcel_id_str = str(row["parcel_id"])
+            is_starred = parcel_id_str in st.session_state["starred_parcels"]
+            star_label = "⭐ Starred" if is_starred else "☆ Star"
+            star_clicked = star_col.button(
+                star_label,
+                use_container_width=True,
+                key=f"star_{parcel_id_str}",
+                help="Bookmark this parcel for the Starred tab.",
+            )
+            if star_clicked:
+                if is_starred:
+                    st.session_state["starred_parcels"].discard(parcel_id_str)
+                else:
+                    st.session_state["starred_parcels"].add(parcel_id_str)
+                st.rerun()
+
             push_one_clicked = push_col.button(
                 "🚀 Push this lead to CRM",
                 disabled=not crm_ready,
@@ -769,6 +865,100 @@ with t_lookup:
                 " ".join(render_link_pill(label, url) for label, url in links),
                 unsafe_allow_html=True,
             )
+
+with t_starred:
+    starred = st.session_state["starred_parcels"]
+    st.markdown(f"##### Starred parcels ({len(starred):,})")
+    st.caption(
+        "Session-scoped bookmarks. Streamlit Cloud filesystem is ephemeral — "
+        "use download / upload below to persist between sessions."
+    )
+
+    if not starred:
+        st.info("No starred parcels yet. Open one in Parcel Lookup and tap ☆ Star.")
+    else:
+        starred_df = leads.filter(pl.col("parcel_id").is_in(list(starred))).select([
+            "score", "county_name", "situs_address", "situs_city", "situs_zip",
+            "owner_name", "owner_state", "just_value", "year_built", "flags", "parcel_id",
+        ]).sort("score", descending=True)
+        st.dataframe(
+            starred_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config=LEAD_COL_CONFIG,
+            height=440,
+        )
+
+        sa, sb, sc = st.columns(3)
+        sa.download_button(
+            "⬇️ Export starred parcel IDs",
+            "\n".join(sorted(starred)),
+            file_name="starred_parcels.txt",
+            mime="text/plain",
+            use_container_width=True,
+        )
+        starred_push_n = min(starred_df.height, 200)
+        push_starred = sb.button(
+            f"🚀 Push all {starred_push_n} to CRM",
+            disabled=not crm_ready,
+            use_container_width=True,
+            key="push_starred_batch",
+        )
+        clear_clicked = sc.button(
+            "🗑 Clear starred list",
+            use_container_width=True,
+            key="clear_starred",
+        )
+        if clear_clicked:
+            st.session_state["starred_parcels"] = set()
+            st.rerun()
+
+        if push_starred and crm_ready:
+            rows = starred_df.head(starred_push_n).to_dicts()
+            progress = st.progress(0, text=f"pushing 0/{starred_push_n} …")
+            status_box = st.empty()
+
+            def _cb(done: int, total: int, last: dict) -> None:
+                progress.progress(done / total, text=f"pushing {done}/{total} …")
+
+            stats = crm_push.push_batch(rows, crm_base_url, crm_token, progress_cb=_cb)
+            progress.empty()
+            if stats["failed"] == 0:
+                status_box.success(
+                    f"✅ pushed {stats['total']} — created {stats['created']}, updated {stats['other_ok']}"
+                )
+            else:
+                status_box.warning(
+                    f"pushed {stats['total']} — created {stats['created']}, "
+                    f"updated {stats['other_ok']}, failed {stats['failed']}"
+                )
+
+        st.markdown("---")
+        st.markdown("**Restore from file**")
+        uploaded = st.file_uploader(
+            "Upload parcel-ID list (one ID per line)",
+            type=["txt", "csv"],
+            label_visibility="collapsed",
+            key="starred_upload",
+        )
+        if uploaded is not None:
+            try:
+                content = uploaded.read().decode("utf-8", errors="replace")
+                ids = [line.strip() for line in content.splitlines() if line.strip()]
+                # If CSV, first column is parcel_id
+                ids = [i.split(",")[0].strip() for i in ids]
+                added = 0
+                for pid in ids:
+                    if pid and pid not in st.session_state["starred_parcels"]:
+                        st.session_state["starred_parcels"].add(pid)
+                        added += 1
+                if added:
+                    st.success(f"Added {added} parcels. Tap any other tab and back to refresh.")
+                else:
+                    st.caption("No new parcels added.")
+            except Exception as e:
+                st.error(f"Failed to read upload: {e}")
+
 
 with t_analytics:
     st.markdown("##### Lead distribution")
@@ -973,5 +1163,19 @@ create duplicate leads when you push the same owner twice.
 Charts reflect whatever the sidebar is filtering to. Score and flag
 distributions, top counties, just-value buckets, and a top-25-owner-entities
 leaderboard for the current filter set.
+
+### Shareable filter URLs
+
+Every filter change updates the URL. Copy the address bar (or the
+`📎 Share this filter` snippet in the sidebar) to bookmark or share a
+filter combo — opening it preloads the same state.
 """
     )
+
+# ── Sync current filter state back to URL query params ───────────────────────
+_qp_target = _current_qp()
+_qp_existing = dict(st.query_params)
+if _qp_target != _qp_existing:
+    st.query_params.clear()
+    for k, v in _qp_target.items():
+        st.query_params[k] = v
