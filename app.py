@@ -8,6 +8,7 @@ import polars as pl
 import streamlit as st
 
 import crm_push
+import outreach
 import skip_trace
 from fl_geo import FL_COUNTY_CENTROIDS
 
@@ -17,6 +18,36 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+
+def _password_gate() -> None:
+    """If `app.password` is set in Streamlit secrets, require it before render.
+
+    Locally (no secrets file) the app is open. On Streamlit Cloud, set
+    `app.password = "..."` in the app's Settings → Secrets to lock down.
+    """
+    expected = ""
+    try:
+        expected = st.secrets["app"]["password"]
+    except Exception:
+        pass
+    if not expected:
+        return
+    if st.session_state.get("auth_ok"):
+        return
+
+    st.title("🔒 Locked")
+    st.caption("Enter the dashboard password to continue.")
+    pw = st.text_input("Password", type="password", label_visibility="collapsed")
+    if pw and pw == expected:
+        st.session_state["auth_ok"] = True
+        st.rerun()
+    elif pw:
+        st.error("Wrong password.")
+    st.stop()
+
+
+_password_gate()
 
 DATA_DIR = Path(__file__).parent / "data"
 LEADS_PATH = DATA_DIR / "leads.parquet"
@@ -99,6 +130,28 @@ def cached_ddg(query: str) -> dict:
 
 def load_skip_cache() -> pl.DataFrame:
     return skip_trace.load_cache(SKIP_TRACE_CACHE)
+
+
+def _anthropic_key() -> str:
+    try:
+        return st.secrets["anthropic"]["api_key"]
+    except Exception:
+        return ""
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def cached_opener(parcel_id: str, owner_name: str, flags: str, score: int,
+                  city: str, year_built, just_value, last_sale_year, last_sale_price,
+                  situs_address: str, situs_zip: str, county_name: str) -> dict:
+    """Cached so re-clicking the same parcel within 24h is free."""
+    row = {
+        "parcel_id": parcel_id, "owner_name": owner_name, "flags": flags,
+        "score": score, "situs_city": city, "year_built": year_built,
+        "just_value": just_value, "last_sale_year": last_sale_year,
+        "last_sale_price": last_sale_price, "situs_address": situs_address,
+        "situs_zip": situs_zip, "county_name": county_name,
+    }
+    return outreach.draft_opener(row, _anthropic_key())
 
 
 st.markdown(
@@ -813,7 +866,9 @@ with t_lookup:
                         f"❌ failed: {res.get('error') or res.get('details') or res.get('status')}"
                     )
 
-            colA, colB = st.columns(2)
+            anthropic_ready = bool(_anthropic_key())
+
+            colA, colB, colC = st.columns(3)
             run_sunbiz = colA.button(
                 "🏛️ Sunbiz live lookup",
                 disabled=not is_entity,
@@ -829,6 +884,18 @@ with t_lookup:
                 "🔎 DuckDuckGo search",
                 help="Free web search for owner + city. Pulls website, socials, email, phone from results.",
                 use_container_width=True,
+            )
+            run_opener = colC.button(
+                "✍️ Draft opener (AI)",
+                disabled=not anthropic_ready,
+                help=(
+                    "Use Claude Haiku to draft a 2–3 sentence custom opener tuned to this "
+                    "lead's flag set. ~$0.001/call."
+                    if anthropic_ready else
+                    "Disabled — set anthropic.api_key in Streamlit secrets to enable."
+                ),
+                use_container_width=True,
+                key=f"opener_{row['parcel_id']}",
             )
 
             if run_sunbiz and is_entity:
@@ -857,6 +924,36 @@ with t_lookup:
                                     unsafe_allow_html=True,
                                 )
                             st.markdown("</div>", unsafe_allow_html=True)
+
+            if run_opener and anthropic_ready:
+                with st.spinner("Drafting opener…"):
+                    res = cached_opener(
+                        row["parcel_id"], row["owner_name"] or "", row["flags"] or "",
+                        int(row["score"] or 0), row["situs_city"] or "",
+                        row.get("year_built"), row.get("just_value"),
+                        row.get("last_sale_year"), row.get("last_sale_price"),
+                        row["situs_address"] or "", row["situs_zip"] or "",
+                        row["county_name"] or "",
+                    )
+                if res.get("ok"):
+                    st.markdown('<div class="skip-section">', unsafe_allow_html=True)
+                    st.markdown('<div class="label">Suggested opener (Claude Haiku)</div>',
+                                unsafe_allow_html=True)
+                    st.markdown(
+                        f'<div style="color:#e6e6e6; font-size:15px; line-height:1.5; '
+                        f'padding:8px 0;">{res["text"]}</div>',
+                        unsafe_allow_html=True,
+                    )
+                    cache_note = ""
+                    if res.get("cached_tokens"):
+                        cache_note = f" · {res['cached_tokens']} cached prompt tokens"
+                    st.caption(
+                        f"in: {res.get('input_tokens', '?')} tok · "
+                        f"out: {res.get('output_tokens', '?')} tok{cache_note}"
+                    )
+                    st.markdown("</div>", unsafe_allow_html=True)
+                else:
+                    st.error(f"Opener failed: {res.get('error', 'unknown')}")
 
             if run_ddg:
                 with st.spinner("Searching the web…"):
@@ -1393,6 +1490,28 @@ leaderboard for the current filter set.
 Every filter change updates the URL. Copy the address bar (or the
 `📎 Share this filter` snippet in the sidebar) to bookmark or share a
 filter combo — opening it preloads the same state.
+
+### AI opener (Claude Haiku)
+
+The Parcel Lookup tab has a `✍️ Draft opener (AI)` button that generates a
+2–3 sentence custom intro tuned to the lead's flag set. Cost is ~$0.001
+per call (system prompt is cached).
+
+To enable, add to your Streamlit Cloud Settings → Secrets:
+```toml
+[anthropic]
+api_key = "sk-ant-..."
+```
+
+### Password gate
+
+Set this in Streamlit Cloud Settings → Secrets to lock the dashboard:
+```toml
+[app]
+password = "your-secret"
+```
+
+Locally (no `secrets.toml`), the app stays open for development.
 """
     )
 
