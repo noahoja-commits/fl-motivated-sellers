@@ -1,5 +1,6 @@
 """Florida Motivated-Sellers Dashboard."""
 
+import re
 from pathlib import Path
 from urllib.parse import quote_plus
 
@@ -616,20 +617,30 @@ with t_lookup:
             # Show cached result if we have one
             cache_hit = skip_trace.lookup_by_owner_norm(load_skip_cache(), row.get("owner_norm", ""))
             if cache_hit:
+                phone = cache_hit.get("phone") or ""
+                email = cache_hit.get("email") or ""
+                phone_html = (
+                    f'<a class="skip-result-val" href="tel:{re.sub(r"[^0-9+]", "", phone)}">{phone}</a>'
+                    if phone else "—"
+                )
+                email_html = (
+                    f'<a class="skip-result-val" href="mailto:{email}">{email}</a>'
+                    if email else "—"
+                )
                 st.markdown(
                     f'<div class="skip-section">'
                     f'<div class="label">Cached · {cache_hit.get("cor_number") or "—"} · '
                     f'scraped {cache_hit.get("scraped_at", "")[:10]}</div>',
                     unsafe_allow_html=True,
                 )
-                cache_fields = {
+                cache_fields_html = {
                     "Status": cache_hit.get("status") or "—",
                     "Last annual report": cache_hit.get("last_report_year") or "—",
                     "Registered agent": cache_hit.get("ra_name") or "—",
-                    "Email": cache_hit.get("email") or "—",
-                    "Phone": cache_hit.get("phone") or "—",
+                    "Email": email_html,
+                    "Phone": phone_html,
                 }
-                for k, v in cache_fields.items():
+                for k, v in cache_fields_html.items():
                     st.markdown(
                         f'<div><span class="skip-result-key">{k}:</span> '
                         f'<span class="skip-result-val">{v}</span></div>',
@@ -821,7 +832,12 @@ with t_analytics:
             st.bar_chart(jv_buckets, color="#9ee29e")
 
         st.markdown("---")
-        st.markdown("**Top 25 owner entities by parcel count (in filtered set)**")
+        st.markdown("**Top 50 owner entities by parcel count (in filtered set)**")
+        st.caption(
+            "Includes cached skip-trace contacts (phone/email tappable). "
+            "Run Bulk skip-trace on Scored Leads tab to fill the cache."
+        )
+        skip_cache_for_owners = load_skip_cache()
         top_owners = (
             filtered.filter(pl.col("is_entity"))
             .group_by("owner_norm")
@@ -829,20 +845,58 @@ with t_analytics:
                 pl.len().alias("parcels"),
                 pl.col("just_value").sum().alias("total_value"),
                 pl.col("county_name").n_unique().alias("counties"),
+                pl.col("score").mean().alias("avg_score"),
                 pl.col("owner_name").first().alias("example_owner"),
             )
-            .sort("parcels", descending=True).head(25)
+            .sort("parcels", descending=True).head(50)
         )
+        if not skip_cache_for_owners.is_empty():
+            top_owners = top_owners.join(
+                skip_cache_for_owners.select([
+                    "owner_norm",
+                    pl.col("status").alias("sb_status"),
+                    pl.col("ra_name").alias("sb_ra_name"),
+                    pl.col("phone").alias("sb_phone"),
+                    pl.col("email").alias("sb_email"),
+                ]),
+                on="owner_norm",
+                how="left",
+            )
+            top_owners = top_owners.with_columns(
+                pl.when(pl.col("sb_phone").is_not_null() & (pl.col("sb_phone") != ""))
+                .then(pl.lit("tel:") + pl.col("sb_phone").str.replace_all(r"[^\d+]", ""))
+                .otherwise(pl.lit(None))
+                .alias("phone_link"),
+                pl.when(pl.col("sb_email").is_not_null() & (pl.col("sb_email") != ""))
+                .then(pl.lit("mailto:") + pl.col("sb_email"))
+                .otherwise(pl.lit(None))
+                .alias("email_link"),
+            )
+        else:
+            for c in ["sb_status", "sb_ra_name", "sb_phone", "sb_email", "phone_link", "email_link"]:
+                top_owners = top_owners.with_columns(pl.lit(None).alias(c))
+
         st.dataframe(
-            top_owners,
+            top_owners.select([
+                "example_owner", "parcels", "total_value", "counties", "avg_score",
+                "sb_status", "sb_ra_name", "phone_link", "email_link",
+            ]).rename({
+                "example_owner": "owner_name",
+                "phone_link": "phone",
+                "email_link": "email",
+            }),
             use_container_width=True,
             hide_index=True,
             column_config={
-                "example_owner": st.column_config.TextColumn("Owner", width="large"),
+                "owner_name": st.column_config.TextColumn("Owner", width="large"),
                 "parcels": st.column_config.NumberColumn("Parcels", format="%d"),
                 "total_value": st.column_config.NumberColumn("Total value", format="$%d"),
                 "counties": st.column_config.NumberColumn("Counties", format="%d"),
-                "owner_norm": st.column_config.TextColumn("Normalized", width="medium"),
+                "avg_score": st.column_config.NumberColumn("Avg score", format="%d"),
+                "sb_status": st.column_config.TextColumn("Sunbiz status", width="small"),
+                "sb_ra_name": st.column_config.TextColumn("Reg. agent", width="medium"),
+                "phone": st.column_config.LinkColumn("Phone", display_text=r".*tel:(.*)"),
+                "email": st.column_config.LinkColumn("Email", display_text=r"mailto:(.*)"),
             },
         )
 
