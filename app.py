@@ -9,6 +9,7 @@ import streamlit as st
 
 import crm_push
 import skip_trace
+from fl_geo import FL_COUNTY_CENTROIDS
 
 st.set_page_config(
     page_title="FL Motivated Sellers",
@@ -42,6 +43,28 @@ CRM_COLUMNS = [
     "situs_zip", "county_name", "just_value", "year_built", "living_area",
     "last_sale_year", "last_sale_price", "signal_type", "score", "flags",
 ]
+
+# Mail-merge: owner address (where letter goes) + property address (subject of
+# letter). Column order is friendly to Avery 5160 templates and Word mail merge.
+MAIL_MERGE_COLUMNS = [
+    "owner_name", "owner_mailing_street", "owner_mailing_city",
+    "owner_state", "owner_mailing_zip",
+    "situs_address", "situs_city", "situs_zip", "county_name",
+    "score", "flags", "parcel_id",
+]
+
+
+def to_mail_merge_csv(df: pl.DataFrame) -> str:
+    cleaned = (
+        df.select([c for c in MAIL_MERGE_COLUMNS if c in df.columns])
+        # Drop rows missing owner mailing — can't mail without the address.
+        .filter(
+            (pl.col("owner_mailing_street").is_not_null()) & (pl.col("owner_mailing_street") != "")
+            & (pl.col("owner_mailing_city").is_not_null()) & (pl.col("owner_mailing_city") != "")
+            & (pl.col("owner_mailing_zip").is_not_null()) & (pl.col("owner_mailing_zip") != "")
+        )
+    )
+    return cleaned.write_csv()
 
 
 @st.cache_data
@@ -351,9 +374,9 @@ st.markdown(kpi_html, unsafe_allow_html=True)
 _starred_count = len(st.session_state["starred_parcels"])
 _star_tab_label = f"⭐ Starred ({_starred_count})" if _starred_count else "⭐ Starred"
 
-t_leads, t_owners, t_addr, t_lookup, t_starred, t_analytics, t_about = st.tabs(
+t_leads, t_owners, t_addr, t_lookup, t_starred, t_analytics, t_map, t_about = st.tabs(
     ["Scored leads", "Multi-property owners", "Address clusters",
-     "Parcel lookup", _star_tab_label, "Analytics", "About"]
+     "Parcel lookup", _star_tab_label, "Analytics", "🗺 Map", "About"]
 )
 
 LEAD_COL_CONFIG = {
@@ -394,27 +417,38 @@ with t_leads:
             column_config=LEAD_COL_CONFIG,
         )
 
-        d1, d2, d3 = st.columns(3)
+        d1, d2, d3, d4 = st.columns(4)
         d1.download_button(
-            "⬇️ Download filtered CSV",
+            "⬇️ Filtered CSV",
             display.write_csv(),
             file_name="motivated_sellers_filtered.csv",
             mime="text/csv",
             use_container_width=True,
+            help="Full columns of the filtered table.",
         )
         crm_ready_csv = (
             filtered.select([c for c in CRM_COLUMNS if c in filtered.columns])
             .sort("score", descending=True)
         )
         d2.download_button(
-            "⬇️ CRM-ready CSV",
+            "⬇️ CRM CSV",
             crm_ready_csv.write_csv(),
             file_name="acquisitions_crm_import.csv",
             mime="text/csv",
             use_container_width=True,
+            help="Column shape matching acquisitions-crm's import script.",
+        )
+        d3.download_button(
+            "⬇️ Mail-merge CSV",
+            to_mail_merge_csv(filtered.sort("score", descending=True)),
+            file_name="mail_merge.csv",
+            mime="text/csv",
+            use_container_width=True,
+            help="Avery / Word mail-merge format: owner mailing + property address. "
+                 "Drops rows missing owner mailing.",
         )
         push_n = min(filtered.height, 200)
-        push_clicked = d3.button(
+        push_clicked = d4.button(
             f"🚀 Push top {push_n} to CRM",
             disabled=not crm_ready or filtered.is_empty(),
             help="POST the highest-score filtered rows to the CRM /api/capture endpoint."
@@ -889,23 +923,31 @@ with t_starred:
             height=440,
         )
 
-        sa, sb, sc = st.columns(3)
+        sa, sb, sc, sd = st.columns(4)
         sa.download_button(
-            "⬇️ Export starred parcel IDs",
+            "⬇️ Parcel IDs",
             "\n".join(sorted(starred)),
             file_name="starred_parcels.txt",
             mime="text/plain",
             use_container_width=True,
         )
+        starred_full = leads.filter(pl.col("parcel_id").is_in(list(starred)))
+        sb.download_button(
+            "⬇️ Mail-merge CSV",
+            to_mail_merge_csv(starred_full.sort("score", descending=True)),
+            file_name="starred_mail_merge.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
         starred_push_n = min(starred_df.height, 200)
-        push_starred = sb.button(
+        push_starred = sc.button(
             f"🚀 Push all {starred_push_n} to CRM",
             disabled=not crm_ready,
             use_container_width=True,
             key="push_starred_batch",
         )
-        clear_clicked = sc.button(
-            "🗑 Clear starred list",
+        clear_clicked = sd.button(
+            "🗑 Clear list",
             use_container_width=True,
             key="clear_starred",
         )
@@ -1089,6 +1131,100 @@ with t_analytics:
                 "email": st.column_config.LinkColumn("Email", display_text=r"mailto:(.*)"),
             },
         )
+
+
+with t_map:
+    import math
+    import pydeck as pdk
+
+    st.markdown("##### Florida lead density by county")
+    st.caption(
+        f"Bubble size = lead count, color intensity = total just-value. "
+        f"Current filter: {filtered.height:,} leads across "
+        f"{filtered['county_name'].n_unique()} counties."
+    )
+
+    if filtered.is_empty():
+        st.info("No leads match the current filters.")
+    else:
+        county_agg = (
+            filtered.group_by("county_name").agg(
+                pl.len().alias("count"),
+                pl.col("just_value").sum().alias("total_value"),
+                pl.col("score").mean().alias("avg_score"),
+            )
+            .sort("count", descending=True)
+            .to_dicts()
+        )
+        max_count = max(r["count"] for r in county_agg) or 1
+        max_val = max(r["total_value"] or 0 for r in county_agg) or 1
+        map_rows = []
+        for r in county_agg:
+            centroid = FL_COUNTY_CENTROIDS.get(r["county_name"])
+            if not centroid:
+                continue
+            lat, lon = centroid
+            radius = max(2500.0, math.sqrt(r["count"] / max_count) * 32_000.0)
+            intensity = (r["total_value"] or 0) / max_val
+            green = int(120 + intensity * 135)
+            map_rows.append({
+                "lat": lat, "lon": lon,
+                "county": r["county_name"],
+                "count": r["count"],
+                "total_value": r["total_value"] or 0,
+                "avg_score": round(r["avg_score"] or 0, 1),
+                "radius": radius,
+                "color": [40, green, 60, 200],
+            })
+
+        if not map_rows:
+            st.warning("No centroids matched the filtered counties.")
+        else:
+            layer = pdk.Layer(
+                "ScatterplotLayer",
+                map_rows,
+                get_position=["lon", "lat"],
+                get_radius="radius",
+                get_fill_color="color",
+                pickable=True,
+                stroked=True,
+                get_line_color=[20, 20, 20, 220],
+                line_width_min_pixels=1,
+            )
+            tooltip = {
+                "html": (
+                    "<b>{county} County</b><br>"
+                    "Leads: {count}<br>"
+                    "Total value: ${total_value}<br>"
+                    "Avg score: {avg_score}"
+                ),
+                "style": {"backgroundColor": "#141414", "color": "#e6e6e6", "fontSize": "12px"},
+            }
+            deck = pdk.Deck(
+                layers=[layer],
+                initial_view_state=pdk.ViewState(
+                    latitude=28.5, longitude=-82.5, zoom=5.7, bearing=0, pitch=0,
+                ),
+                map_style="mapbox://styles/mapbox/dark-v10",
+                tooltip=tooltip,
+            )
+            st.pydeck_chart(deck, use_container_width=True)
+
+            with st.expander("Counties shown (full table)"):
+                table = pl.DataFrame(map_rows).select(
+                    "county", "count", "total_value", "avg_score"
+                ).sort("count", descending=True)
+                st.dataframe(
+                    table,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "county": st.column_config.TextColumn("County"),
+                        "count": st.column_config.NumberColumn("Leads", format="%d"),
+                        "total_value": st.column_config.NumberColumn("Total value", format="$%d"),
+                        "avg_score": st.column_config.NumberColumn("Avg score", format="%.1f"),
+                    },
+                )
 
 
 with t_about:
