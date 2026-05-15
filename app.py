@@ -20,6 +20,7 @@ DATA_DIR = Path(__file__).parent / "data"
 LEADS_PATH = DATA_DIR / "leads.parquet"
 BY_OWNER = DATA_DIR / "by_owner.parquet"
 BY_ADDR = DATA_DIR / "by_address.parquet"
+SKIP_TRACE_CACHE = DATA_DIR / "skip_trace_cache.parquet"
 
 CURRENT_YEAR = 2026
 
@@ -70,6 +71,10 @@ def cached_sunbiz_detail(cor_number: str) -> dict:
 @st.cache_data(ttl=86400, show_spinner=False)
 def cached_ddg(query: str) -> dict:
     return skip_trace.duckduckgo_lookup(query)
+
+
+def load_skip_cache() -> pl.DataFrame:
+    return skip_trace.load_cache(SKIP_TRACE_CACHE)
 
 
 st.markdown(
@@ -335,6 +340,85 @@ with t_leads:
                  " Capped at 200/click for safety.",
             use_container_width=True,
         )
+
+        # Bulk skip-trace
+        st.markdown("---")
+        skip_cache_df = load_skip_cache()
+        entity_filtered = filtered.filter(pl.col("is_entity"))
+        unique_entities = entity_filtered.unique(subset=["owner_norm"]).height
+        already_cached = (
+            entity_filtered.filter(
+                pl.col("owner_norm").is_in(skip_cache_df["owner_norm"].to_list())
+            ).unique(subset=["owner_norm"]).height
+            if not skip_cache_df.is_empty() else 0
+        )
+        to_run = unique_entities - already_cached
+        bulk_n = min(to_run, 100)
+
+        st1, st2 = st.columns([3, 2])
+        st1.caption(
+            f"Skip-trace cache: {skip_cache_df.height:,} entities. "
+            f"In current filter: {unique_entities:,} unique entity owners "
+            f"({already_cached:,} already cached, {to_run:,} new)."
+        )
+        bulk_clicked = st2.button(
+            f"🕵️ Bulk skip-trace next {bulk_n}",
+            disabled=bulk_n <= 0,
+            help="Sunbiz live lookups for entity owners not yet in the cache. "
+                 "~2 sec each (so up to ~4 min for 100 owners). Free, no API key.",
+            use_container_width=True,
+        )
+        if bulk_clicked and bulk_n > 0:
+            targets = (
+                entity_filtered
+                .filter(~pl.col("owner_norm").is_in(skip_cache_df["owner_norm"].to_list()))
+                .unique(subset=["owner_norm"])
+                .sort("score", descending=True)
+                .head(bulk_n)
+                .select(["owner_norm", "owner_name"])
+                .to_dicts()
+            )
+            progress = st.progress(0, text=f"skip-tracing 0/{len(targets)} …")
+            status_box = st.empty()
+
+            def cb(done: int, total: int, last: dict) -> None:
+                label = last.get("owner", "")[:60]
+                progress.progress(done / total, text=f"skip-tracing {done}/{total} — {label}")
+
+            stats = skip_trace.bulk_sunbiz_trace(
+                targets, SKIP_TRACE_CACHE, delay_sec=2.0, on_progress=cb,
+            )
+            progress.empty()
+            load_skip_cache.clear() if hasattr(load_skip_cache, "clear") else None
+            status_box.success(
+                f"✅ done — found {stats['found']}, no Sunbiz match {stats['no_match']}, "
+                f"errors {stats['errors']}. Cache now has {stats['cache_size']:,} entities."
+            )
+
+        if not skip_cache_df.is_empty():
+            cache_d1, cache_d2 = st.columns([1, 1])
+            cache_d1.download_button(
+                "⬇️ Download skip-trace cache",
+                skip_cache_df.write_csv(),
+                file_name="skip_trace_cache.csv",
+                mime="text/csv",
+                use_container_width=True,
+                help="Keep a copy — Streamlit Cloud filesystem is ephemeral.",
+            )
+            uploaded = cache_d2.file_uploader(
+                "Upload cache (.csv)",
+                type=["csv"],
+                label_visibility="collapsed",
+            )
+            if uploaded is not None:
+                try:
+                    incoming = pl.read_csv(uploaded)
+                    merged = pl.concat([skip_cache_df, incoming], how="diagonal_relaxed")
+                    merged = merged.unique(subset=["owner_norm"], keep="last")
+                    skip_trace.save_cache(merged, SKIP_TRACE_CACHE)
+                    st.success(f"Merged {incoming.height:,} rows. Cache now {merged.height:,}.")
+                except Exception as e:
+                    st.error(f"Failed to merge cache: {e}")
         if push_clicked and crm_ready:
             rows = filtered.sort("score", descending=True).head(push_n).to_dicts()
             progress = st.progress(0, text=f"pushing 0/{push_n} …")
@@ -528,6 +612,30 @@ with t_lookup:
             st.markdown("##### 🕵️ Skip trace")
 
             is_entity = bool(row.get("is_entity"))
+
+            # Show cached result if we have one
+            cache_hit = skip_trace.lookup_by_owner_norm(load_skip_cache(), row.get("owner_norm", ""))
+            if cache_hit:
+                st.markdown(
+                    f'<div class="skip-section">'
+                    f'<div class="label">Cached · {cache_hit.get("cor_number") or "—"} · '
+                    f'scraped {cache_hit.get("scraped_at", "")[:10]}</div>',
+                    unsafe_allow_html=True,
+                )
+                cache_fields = {
+                    "Status": cache_hit.get("status") or "—",
+                    "Last annual report": cache_hit.get("last_report_year") or "—",
+                    "Registered agent": cache_hit.get("ra_name") or "—",
+                    "Email": cache_hit.get("email") or "—",
+                    "Phone": cache_hit.get("phone") or "—",
+                }
+                for k, v in cache_fields.items():
+                    st.markdown(
+                        f'<div><span class="skip-result-key">{k}:</span> '
+                        f'<span class="skip-result-val">{v}</span></div>',
+                        unsafe_allow_html=True,
+                    )
+                st.markdown("</div>", unsafe_allow_html=True)
 
             # Per-parcel push to CRM
             push_col, _ = st.columns([2, 5])

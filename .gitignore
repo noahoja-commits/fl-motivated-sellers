@@ -7,3 +7,4 @@ venv/
 .streamlit/secrets.toml
 streamlit.log
 score_run.log
+data/skip_trace_cache.parquet

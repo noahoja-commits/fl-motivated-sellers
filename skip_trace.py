@@ -6,8 +6,13 @@ Ported and trimmed from sunbizdashboard-main/app.py.
 from __future__ import annotations
 
 import re
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Callable
 from urllib.parse import parse_qs, unquote, urlparse
 
+import polars as pl
 import requests
 from bs4 import BeautifulSoup
 
@@ -111,6 +116,120 @@ def sunbiz_detail(cor_number: str) -> dict:
         pass
 
     return out
+
+
+CACHE_COLUMNS = [
+    "owner_norm", "cor_number", "status", "ra_name", "email", "phone",
+    "last_report_year", "scraped_at",
+]
+
+
+def load_cache(path: Path) -> pl.DataFrame:
+    """Load existing skip-trace cache or return an empty frame."""
+    if path.exists():
+        try:
+            df = pl.read_parquet(path)
+            for c in CACHE_COLUMNS:
+                if c not in df.columns:
+                    df = df.with_columns(pl.lit(None).alias(c))
+            return df.select(CACHE_COLUMNS)
+        except Exception:
+            pass
+    return pl.DataFrame(
+        schema={c: pl.Utf8 for c in CACHE_COLUMNS},
+    )
+
+
+def save_cache(df: pl.DataFrame, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.write_parquet(path, compression="zstd")
+
+
+def lookup_by_owner_norm(cache: pl.DataFrame, owner_norm: str) -> dict | None:
+    """Return cached skip-trace result for a normalized owner name, or None."""
+    if not owner_norm or cache.is_empty():
+        return None
+    hit = cache.filter(pl.col("owner_norm") == owner_norm)
+    if hit.is_empty():
+        return None
+    return hit.row(0, named=True)
+
+
+def bulk_sunbiz_trace(
+    targets: list[dict],
+    cache_path: Path,
+    delay_sec: float = 2.0,
+    on_progress: Callable[[int, int, dict], None] | None = None,
+) -> dict:
+    """Run Sunbiz lookups for a list of {owner_norm, owner_name} dicts.
+
+    Skips entries already in the cache. Appends new results to the cache
+    parquet and saves to disk. Returns aggregate stats.
+    """
+    cache = load_cache(cache_path)
+    cached_names: set[str] = set(cache["owner_norm"].to_list()) if not cache.is_empty() else set()
+
+    new_rows: list[dict] = []
+    found = 0
+    no_match = 0
+    errors = 0
+    total = len(targets)
+
+    for i, t in enumerate(targets):
+        owner_norm = (t.get("owner_norm") or "").strip()
+        owner_name = (t.get("owner_name") or "").strip()
+        if not owner_norm or owner_norm in cached_names:
+            if on_progress:
+                on_progress(i + 1, total, {"status": "skip_cached"})
+            continue
+
+        cor_number = sunbiz_search_by_name(owner_name or owner_norm)
+        detail: dict = {}
+        status = "no_match"
+        if cor_number:
+            detail = sunbiz_detail(cor_number)
+            if detail.get("page_found"):
+                status = "found"
+                found += 1
+            else:
+                status = "detail_failed"
+                errors += 1
+        else:
+            no_match += 1
+
+        new_rows.append({
+            "owner_norm": owner_norm,
+            "cor_number": cor_number or "",
+            "status": detail.get("live_status", "") if status == "found" else status,
+            "ra_name": detail.get("registered_agent", ""),
+            "email": detail.get("email", ""),
+            "phone": detail.get("phone", ""),
+            "last_report_year": detail.get("last_report_year", ""),
+            "scraped_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        })
+        cached_names.add(owner_norm)
+
+        if on_progress:
+            on_progress(i + 1, total, {"status": status, "owner": owner_name})
+
+        if delay_sec > 0 and i < total - 1:
+            time.sleep(delay_sec)
+
+    if new_rows:
+        new_df = pl.DataFrame(new_rows)
+        merged = pl.concat([cache, new_df], how="diagonal_relaxed")
+        save_cache(merged, cache_path)
+    else:
+        merged = cache
+
+    return {
+        "scanned": total,
+        "new_lookups": len(new_rows),
+        "found": found,
+        "no_match": no_match,
+        "errors": errors,
+        "cache_size": merged.height,
+    }
 
 
 def sunbiz_search_by_name(name: str) -> str:
