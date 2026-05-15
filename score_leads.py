@@ -37,12 +37,13 @@ COUNTIES: dict[int, str] = {
 }
 
 DEFAULT_COUNTIES = [
-    15, 18, 19, 26, 37, 39, 45, 46, 51, 52,
-    58, 59, 61, 62, 63, 65, 66, 68, 70, 74,
+    15, 16, 18, 19, 23, 26, 37, 39, 45, 46,
+    51, 52, 58, 59, 61, 62, 63, 65, 66, 68,
+    70, 74,
 ]
-# Brevard, Charlotte, Citrus, Duval, Hernando, Hillsborough, Lake, Lee, Manatee,
-# Marion, Orange, Osceola, Pasco, Pinellas, Polk, Saint Johns, Saint Lucie,
-# Sarasota, Sumter, Volusia
+# Brevard, Broward, Charlotte, Citrus, Dade, Duval, Hernando, Hillsborough,
+# Lake, Lee, Manatee, Marion, Orange, Osceola, Pasco, Pinellas, Polk,
+# Saint Johns, Saint Lucie, Sarasota, Sumter, Volusia
 RESIDENTIAL_DOR = {"001", "002", "004", "005", "006", "008"}
 MULTIFAMILY_DOR = {"003", "008", "009"}
 CURRENT_YEAR = 2026
