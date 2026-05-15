@@ -36,7 +36,13 @@ COUNTIES: dict[int, str] = {
     76: "Walton", 77: "Washington",
 }
 
-DEFAULT_COUNTIES = [19, 37, 39, 51, 61, 62, 63, 68]  # Citrus, Hernando, Hillsborough, Manatee, Pasco, Pinellas, Polk, Sarasota
+DEFAULT_COUNTIES = [
+    15, 18, 19, 26, 37, 39, 45, 46, 51, 52,
+    58, 59, 61, 62, 63, 65, 66, 68, 70, 74,
+]
+# Brevard, Charlotte, Citrus, Duval, Hernando, Hillsborough, Lake, Lee, Manatee,
+# Marion, Orange, Osceola, Pasco, Pinellas, Polk, Saint Johns, Saint Lucie,
+# Sarasota, Sumter, Volusia
 RESIDENTIAL_DOR = {"001", "002", "004", "005", "006", "008"}
 MULTIFAMILY_DOR = {"003", "008", "009"}
 CURRENT_YEAR = 2026
@@ -205,19 +211,49 @@ def main() -> None:
     if not files:
         raise SystemExit("no input files found")
 
-    df = pl.concat([pl.read_parquet(f) for f in files], how="diagonal_relaxed")
-    print(f"  loaded {df.height:,} rows")
+    # Process one county at a time — keeps peak RAM low.
+    # multi_property_owner is already intra-county, so per-county is correct.
+    per_county_out: list[pl.DataFrame] = []
+    grand_loaded = 0
+    grand_flagged = 0
 
-    df = df.filter(pl.col("DOR_UC").is_in(list(RESIDENTIAL_DOR)))
-    print(f"  after residential filter: {df.height:,} rows")
+    expected_cols = {
+        "TOT_LVG_AREA": pl.Int64, "NO_RES_UNTS": pl.Int64,
+        "ACT_YR_BLT": pl.Int64, "EFF_YR_BLT": pl.Int64,
+        "SALE_PRC1": pl.Int64, "SALE_YR1": pl.Int64,
+        "SALE_PRC2": pl.Int64, "SALE_YR2": pl.Int64,
+        "OWN_ADDR2": pl.Utf8, "OWN_CITY": pl.Utf8, "OWN_STATE": pl.Utf8,
+    }
 
-    scored = score(df)
-    print(f"  flagged: {scored.height:,} rows")
+    for f in files:
+        df = pl.read_parquet(f)
+        loaded = df.height
+        grand_loaded += loaded
 
-    out = shape_output(scored).filter(pl.col("score") >= args.min_score).sort(
-        "score", descending=True
-    )
-    print(f"  after min-score {args.min_score}: {out.height:,} rows")
+        # Some county parquets lack optional columns — backfill with nulls so
+        # downstream score()/shape_output() can always select them.
+        for col, dtype in expected_cols.items():
+            if col not in df.columns:
+                df = df.with_columns(pl.lit(None, dtype=dtype).alias(col))
+
+        df = df.filter(pl.col("DOR_UC").is_in(list(RESIDENTIAL_DOR)))
+        scored = score(df)
+        del df
+        flagged = scored.height
+        grand_flagged += flagged
+
+        out_county = (
+            shape_output(scored)
+            .filter(pl.col("score") >= args.min_score)
+        )
+        del scored
+        per_county_out.append(out_county)
+        print(f"  {f.name}: {loaded:,} → {flagged:,} flagged → {out_county.height:,} ≥{args.min_score}")
+
+    print(f"totals: loaded {grand_loaded:,} → flagged {grand_flagged:,}")
+
+    out = pl.concat(per_county_out, how="diagonal_relaxed").sort("score", descending=True)
+    print(f"  combined output: {out.height:,} rows")
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     out.write_csv(args.output)
