@@ -605,33 +605,48 @@ with t_addr:
     st.markdown("##### Mailing-address clusters")
     st.caption(
         f"{by_addr.height:,} mailing addresses tied to 5+ parcels each — property managers, "
-        f"big landlords, multifamily ownership entities."
+        f"big landlords, and (when distinct owners > 1) likely shell-company clusters."
     )
-    min_a_parcels = st.slider(
+
+    addr_c1, addr_c2 = st.columns([1, 1])
+    min_a_parcels = addr_c1.slider(
         "Min parcels per address",
         int(by_addr["parcel_count"].min()),
         int(by_addr["parcel_count"].max()),
         5, key="addr_min",
     )
+    shell_only = addr_c2.checkbox(
+        "Shell-company candidates only (≥ 2 distinct owner names)",
+        help="Surface addresses where multiple different entity names share the same mailing addr.",
+        key="addr_shell_only",
+    )
+
+    addr_view = by_addr.filter(pl.col("parcel_count") >= min_a_parcels)
+    if shell_only:
+        addr_view = addr_view.filter(pl.col("distinct_owner_names") >= 2)
     addr_view = (
-        by_addr.filter(pl.col("parcel_count") >= min_a_parcels)
+        addr_view.with_columns(
+            pl.col("owner_names").list.unique().list.head(5).list.join(" · ").alias("owners_preview")
+        )
         .select([
             "addr_norm", "parcel_count", "distinct_owner_names",
-            "total_just_value", "county_count",
+            "total_just_value", "county_count", "owners_preview",
         ])
         .sort("parcel_count", descending=True)
     )
+
     st.dataframe(
         addr_view,
         use_container_width=True,
         height=500,
         hide_index=True,
         column_config={
-            "addr_norm": st.column_config.TextColumn("Address", width="large"),
+            "addr_norm": st.column_config.TextColumn("Address", width="medium"),
             "parcel_count": st.column_config.NumberColumn("Parcels", format="%d"),
             "distinct_owner_names": st.column_config.NumberColumn("Distinct owners", format="%d"),
             "total_just_value": st.column_config.NumberColumn("Total value", format="$%d"),
             "county_count": st.column_config.NumberColumn("Counties", format="%d"),
+            "owners_preview": st.column_config.TextColumn("Owners (first 5)", width="large"),
         },
     )
     st.download_button(
@@ -899,6 +914,79 @@ with t_lookup:
                 " ".join(render_link_pill(label, url) for label, url in links),
                 unsafe_allow_html=True,
             )
+
+            # ── Connected parcels (owner network) ─────────────────────────────
+            st.markdown("---")
+            st.markdown("##### 🕸️ Connected parcels")
+
+            owner_norm_val = (row.get("owner_norm") or "").strip()
+            mail_street_val = (row.get("owner_mailing_street") or "").strip()
+            mail_city_val = (row.get("owner_mailing_city") or "").strip()
+
+            same_owner = (
+                leads.filter(
+                    (pl.col("owner_norm") == owner_norm_val)
+                    & (pl.col("parcel_id") != row["parcel_id"])
+                )
+                if owner_norm_val else pl.DataFrame()
+            )
+            same_addr = (
+                leads.filter(
+                    (pl.col("owner_mailing_street") == mail_street_val)
+                    & (pl.col("owner_mailing_city") == mail_city_val)
+                    & (pl.col("owner_norm") != owner_norm_val)
+                )
+                if mail_street_val and mail_city_val else pl.DataFrame()
+            )
+
+            net_col1, net_col2 = st.columns(2)
+            with net_col1:
+                st.markdown(f"**Same owner — {same_owner.height} other parcel(s)**")
+                if same_owner.is_empty():
+                    st.caption("None in the dashboard's lead set.")
+                else:
+                    st.dataframe(
+                        same_owner.select([
+                            "score", "county_name", "situs_address", "situs_city",
+                            "just_value", "flags", "parcel_id",
+                        ]).sort("score", descending=True).head(50),
+                        use_container_width=True,
+                        hide_index=True,
+                        height=240,
+                        column_config={
+                            "score": st.column_config.ProgressColumn(
+                                "Score", min_value=0, max_value=100, format="%d"
+                            ),
+                            "just_value": st.column_config.NumberColumn("Just $", format="$%d"),
+                            "county_name": st.column_config.TextColumn("County", width="small"),
+                            "situs_city": st.column_config.TextColumn("City", width="small"),
+                        },
+                    )
+            with net_col2:
+                st.markdown(
+                    f"**Same mailing addr, different owner name — {same_addr.height} parcel(s)**"
+                )
+                st.caption("Possible shell-company / property-manager links.")
+                if same_addr.is_empty():
+                    st.caption("None.")
+                else:
+                    st.dataframe(
+                        same_addr.select([
+                            "owner_name", "score", "county_name", "situs_address",
+                            "just_value", "parcel_id",
+                        ]).sort("score", descending=True).head(50),
+                        use_container_width=True,
+                        hide_index=True,
+                        height=240,
+                        column_config={
+                            "owner_name": st.column_config.TextColumn("Owner", width="medium"),
+                            "score": st.column_config.ProgressColumn(
+                                "Score", min_value=0, max_value=100, format="%d"
+                            ),
+                            "just_value": st.column_config.NumberColumn("Just $", format="$%d"),
+                            "county_name": st.column_config.TextColumn("County", width="small"),
+                        },
+                    )
 
 with t_starred:
     starred = st.session_state["starred_parcels"]
