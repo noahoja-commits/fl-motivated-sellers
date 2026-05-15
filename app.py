@@ -84,6 +84,17 @@ MAIL_MERGE_COLUMNS = [
     "score", "flags", "parcel_id",
 ]
 
+# Polars panics serializing very large frames to CSV on this machine.
+# Cap downloads at a safe size — fits Excel and any practical workflow.
+CSV_EXPORT_CAP = 25_000
+
+
+def safe_csv(df: pl.DataFrame) -> str:
+    """write_csv with a row cap to avoid polars panics on huge frames."""
+    if df.height > CSV_EXPORT_CAP:
+        df = df.head(CSV_EXPORT_CAP)
+    return df.write_csv()
+
 
 def to_mail_merge_csv(df: pl.DataFrame) -> str:
     cleaned = (
@@ -95,7 +106,7 @@ def to_mail_merge_csv(df: pl.DataFrame) -> str:
             & (pl.col("owner_mailing_zip").is_not_null()) & (pl.col("owner_mailing_zip") != "")
         )
     )
-    return cleaned.write_csv()
+    return safe_csv(cleaned)
 
 
 @st.cache_data
@@ -473,7 +484,7 @@ with t_leads:
         d1, d2, d3, d4 = st.columns(4)
         d1.download_button(
             "⬇️ Filtered CSV",
-            display.write_csv(),
+            safe_csv(display),
             file_name="motivated_sellers_filtered.csv",
             mime="text/csv",
             use_container_width=True,
@@ -485,7 +496,7 @@ with t_leads:
         )
         d2.download_button(
             "⬇️ CRM CSV",
-            crm_ready_csv.write_csv(),
+            safe_csv(crm_ready_csv),
             file_name="acquisitions_crm_import.csv",
             mime="text/csv",
             use_container_width=True,
@@ -649,7 +660,7 @@ with t_owners:
     )
     st.download_button(
         "⬇️ Download owner list",
-        owner_view.write_csv(),
+        safe_csv(owner_view),
         file_name="multi_property_owners.csv",
         mime="text/csv",
     )
@@ -704,7 +715,7 @@ with t_addr:
     )
     st.download_button(
         "⬇️ Download address clusters",
-        addr_view.write_csv(),
+        safe_csv(addr_view),
         file_name="address_clusters.csv",
         mime="text/csv",
     )
