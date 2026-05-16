@@ -11,7 +11,3 @@ gatherUsageStats = false
 
 [server]
 headless = true
-# HF's reverse proxy mangles compressed WS frames -> blank page; disable all three.
-enableCORS = false
-enableXsrfProtection = false
-enableWebsocketCompression = false
