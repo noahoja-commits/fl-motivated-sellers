@@ -109,9 +109,32 @@ def to_mail_merge_csv(df: pl.DataFrame) -> str:
     return safe_csv(cleaned)
 
 
+# Downcast map: Int64 columns that fit comfortably in narrower types. Values
+# are unchanged — purely a memory representation change. Int16 holds 0..32767
+# (years, score, unit counts); Int32 holds 0..2.1B (dollar amounts, sqft).
+# just_value is deliberately left Int64 — it gets .sum()'d across 218k rows
+# (KPI strip, Map, owner leaderboard) and Int32 could overflow that total.
+_DOWNCAST = {
+    "score": pl.Int16,
+    "last_sale_price": pl.Int32, "prior_sale_price": pl.Int32,
+    "living_area": pl.Int32,
+    "last_sale_year": pl.Int16, "prior_sale_year": pl.Int16,
+    "year_built": pl.Int16, "residential_units": pl.Int16,
+}
+# Repeated-value string columns → Categorical (dictionary-encoded in memory).
+# county_name has 67 distinct values across 218k rows, signal_type just 1.
+_CATEGORICAL = ("county_name", "owner_state", "signal_type", "dor_uc")
+
+
 @st.cache_data
 def load_leads() -> pl.DataFrame:
-    return pl.read_parquet(LEADS_PATH)
+    df = pl.read_parquet(LEADS_PATH)
+    # evidence_url is always empty — drop it rather than carry 218k empty strings.
+    if "evidence_url" in df.columns:
+        df = df.drop("evidence_url")
+    casts = [pl.col(c).cast(t, strict=False) for c, t in _DOWNCAST.items() if c in df.columns]
+    casts += [pl.col(c).cast(pl.Categorical) for c in _CATEGORICAL if c in df.columns]
+    return df.with_columns(casts) if casts else df
 
 
 @st.cache_data
@@ -124,17 +147,19 @@ def load_by_address() -> pl.DataFrame:
     return pl.read_parquet(BY_ADDR)
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
+# ttl=24h AND max_entries — bound both the age and the count of cached lookups
+# so a long-running session can't grow these caches without limit.
+@st.cache_data(ttl=86400, max_entries=512, show_spinner=False)
 def cached_sunbiz_search(name: str) -> str:
     return skip_trace.sunbiz_search_by_name(name)
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
+@st.cache_data(ttl=86400, max_entries=512, show_spinner=False)
 def cached_sunbiz_detail(cor_number: str) -> dict:
     return skip_trace.sunbiz_detail(cor_number)
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
+@st.cache_data(ttl=86400, max_entries=512, show_spinner=False)
 def cached_ddg(query: str) -> dict:
     return skip_trace.duckduckgo_lookup(query)
 
@@ -150,7 +175,7 @@ def _anthropic_key() -> str:
         return ""
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
+@st.cache_data(ttl=86400, max_entries=512, show_spinner=False)
 def cached_opener(parcel_id: str, owner_name: str, flags: str, score: int,
                   city: str, year_built, just_value, last_sale_year, last_sale_price,
                   situs_address: str, situs_zip: str, county_name: str) -> dict:
