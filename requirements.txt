@@ -6,3 +6,4 @@ beautifulsoup4>=4.12.0
 lxml>=5.0.0
 anthropic>=0.39.0
 pydeck>=0.9.0
+pgeocode>=0.5.0

@@ -280,6 +280,95 @@ def shape_output(df: pl.DataFrame) -> pl.DataFrame:
     )
 
 
+def add_distance(df: pl.DataFrame) -> pl.DataFrame:
+    """Add owner_distance_mi — miles between the owner's mailing zip and the
+    property's situs zip (haversine). Null when either zip can't be geocoded.
+    A large distance is a strong absentee-motivation signal."""
+    import pgeocode
+
+    def _z5(col: str) -> pl.Expr:
+        return pl.col(col).cast(pl.Utf8).str.replace_all(r"[^0-9]", "").str.slice(0, 5)
+
+    df = df.with_columns(_z5("situs_zip").alias("_sz"), _z5("owner_mailing_zip").alias("_oz"))
+    uniq = (
+        pl.concat([df.select(pl.col("_sz").alias("z")), df.select(pl.col("_oz").alias("z"))])
+        .filter(pl.col("z").str.len_chars() == 5)
+        .select("z").unique().to_series().to_list()
+    )
+    if not uniq:
+        return df.drop("_sz", "_oz").with_columns(
+            pl.lit(None, dtype=pl.Int32).alias("owner_distance_mi")
+        )
+    geo = pgeocode.Nominatim("us").query_postal_code(uniq)
+    zip_geo = (
+        pl.DataFrame({"z": uniq, "lat": geo["latitude"].tolist(), "lon": geo["longitude"].tolist()})
+        .with_columns(pl.col("lat").fill_nan(None), pl.col("lon").fill_nan(None))
+        .drop_nulls()
+    )
+    df = (
+        df.join(zip_geo.rename({"z": "_sz", "lat": "_slat", "lon": "_slon"}), on="_sz", how="left")
+        .join(zip_geo.rename({"z": "_oz", "lat": "_olat", "lon": "_olon"}), on="_oz", how="left")
+    )
+    R = 3958.8  # earth radius, miles
+    dlat = (pl.col("_olat") - pl.col("_slat")).radians()
+    dlon = (pl.col("_olon") - pl.col("_slon")).radians()
+    a = (
+        (dlat / 2).sin().pow(2)
+        + pl.col("_slat").radians().cos()
+        * pl.col("_olat").radians().cos()
+        * (dlon / 2).sin().pow(2)
+    )
+    dist = (2 * R * a.sqrt().arcsin()).round(0).cast(pl.Int32, strict=False)
+    return df.with_columns(dist.alias("owner_distance_mi")).drop(
+        "_sz", "_oz", "_slat", "_slon", "_olat", "_olon"
+    )
+
+
+_SUMMARY_HEAD = [
+    ("out_of_state", "out-of-state owner"),
+    ("out_of_zip", "absentee owner (mails out of area)"),
+    ("trust_estate_name", "trust/estate-owned"),
+    ("po_box", "PO-box mailing"),
+    ("long_held_25y", "held 25+ years"),
+    ("multi_property_owner", "owns multiple parcels"),
+]
+_SUMMARY_TAIL = [
+    ("high_equity_proxy", "likely high equity"),
+    ("sale_anomaly", "unusual last-sale price"),
+    ("bank_trustee", "bank/trustee-held"),
+]
+
+
+def _summarize(flags: str, owner_state: str) -> str:
+    """Plain-English motivation summary built deterministically from flags."""
+    fl = set((flags or "").split(","))
+    head: list[str] = []
+    for key, phrase in _SUMMARY_HEAD:
+        if key not in fl:
+            continue
+        if key == "out_of_state":
+            if owner_state:
+                phrase = f"out-of-state owner ({owner_state})"
+            fl.discard("out_of_zip")  # out_of_state already implies absentee
+        head.append(phrase)
+    tail = [p for k, p in _SUMMARY_TAIL if k in fl]
+    if not head:
+        head = ["flagged parcel"]
+    text = ", ".join(head)
+    text = text[0].upper() + text[1:]
+    if tail:
+        text += " — " + ", ".join(tail)
+    return text + "."
+
+
+def add_lead_summary(df: pl.DataFrame) -> pl.DataFrame:
+    return df.with_columns(
+        pl.struct(["flags", "owner_state"])
+        .map_elements(lambda s: _summarize(s["flags"], s["owner_state"]), return_dtype=pl.Utf8)
+        .alias("lead_summary")
+    )
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument(
@@ -384,6 +473,12 @@ def main() -> None:
         f"  new leads this run: {new_count:,}  "
         f"(seen-parcel snapshot: {updated_seen.height:,})"
     )
+
+    # ── Owner distance + plain-English summary ─────────────────────────────
+    out = add_distance(out)
+    _resolved = out.filter(pl.col("owner_distance_mi").is_not_null()).height
+    print(f"  owner-distance geocoded: {_resolved:,} of {out.height:,}")
+    out = add_lead_summary(out)
 
     if args.output.suffix.lower() == ".parquet":
         out.write_parquet(args.output, compression="zstd")

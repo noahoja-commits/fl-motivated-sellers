@@ -118,7 +118,7 @@ def to_mail_merge_csv(df: pl.DataFrame) -> str:
 _DOWNCAST = {
     "score": pl.Int16, "opportunity_score": pl.Int16,
     "last_sale_price": pl.Int32, "prior_sale_price": pl.Int32,
-    "est_equity": pl.Int32,
+    "est_equity": pl.Int32, "owner_distance_mi": pl.Int16,
     "living_area": pl.Int32,
     "last_sale_year": pl.Int16, "prior_sale_year": pl.Int16,
     "year_built": pl.Int16, "residential_units": pl.Int16,
@@ -278,6 +278,7 @@ st.session_state.setdefault("f_repair_est", 30_000)
 st.session_state.setdefault("f_new_only", False)
 st.session_state.setdefault("f_hide_crm", False)
 st.session_state.setdefault("f_sort", "Opportunity")
+st.session_state.setdefault("f_min_distance", 0)
 
 _require_from_url = set(_qp_csv("require"))
 _exclude_from_url = set(_qp_csv("exclude"))
@@ -329,6 +330,12 @@ with st.sidebar:
         entity_only = st.checkbox(
             "LLC / entity owners only", key="f_entity_only",
             help="Owner is an LLC, trust, or other entity (not an individual).",
+        )
+        min_distance = st.number_input(
+            "Owner ≥ N miles away", min_value=0, max_value=3000, step=25,
+            key="f_min_distance",
+            help="Distance from the owner's mailing address to the property. "
+                 "Far-away absentee owners are markedly more motivated. 0 = no limit.",
         )
 
     with st.expander("💰 Deal math"):
@@ -530,6 +537,8 @@ def apply_filters(df: pl.DataFrame) -> pl.DataFrame:
         )
     if entity_only:
         out = out.filter(pl.col("is_entity"))
+    if min_distance > 0 and "owner_distance_mi" in out.columns:
+        out = out.filter(pl.col("owner_distance_mi") >= min_distance)
     if new_only and _latest_seen is not None and "first_seen" in out.columns:
         out = out.filter(pl.col("first_seen") == _latest_seen)
     if hide_crm_dupes and _crm_known:
@@ -613,6 +622,13 @@ LEAD_COL_CONFIG = {
         "Offer (est.)", format="$%d", help="70% of just-value − your repair estimate.",
     ),
     "first_seen": st.column_config.TextColumn("First seen", width="small"),
+    "owner_distance_mi": st.column_config.NumberColumn(
+        "Owner mi away", format="%d mi",
+        help="Distance from the owner's mailing address to the property.",
+    ),
+    "lead_summary": st.column_config.TextColumn(
+        "Why this lead", width="large", help="Plain-English read on the motivation signals.",
+    ),
     "county_name": st.column_config.TextColumn("County", width="small"),
     "situs_address": st.column_config.TextColumn("Address", width="medium"),
     "situs_city": st.column_config.TextColumn("City", width="small"),
@@ -641,12 +657,13 @@ with t_leads:
             "Offer (est.)": "offer_estimate",
             "Just value": "just_value",
             "Est. equity": "est_equity",
+            "Distance from owner": "owner_distance_mi",
         }
         _sort_label = st.selectbox("Sort by", list(_sort_opts), key="f_sort")
         display = filtered.select([
-            "opportunity_score", "score", "county_name", "situs_address",
+            "opportunity_score", "score", "lead_summary", "county_name", "situs_address",
             "situs_city", "situs_zip", "owner_name", "owner_mailing", "owner_state",
-            "just_value", "est_equity", "offer_estimate", "year_built",
+            "owner_distance_mi", "just_value", "est_equity", "offer_estimate", "year_built",
             "residential_units", "last_sale_year", "flags", "first_seen", "parcel_id",
         ]).sort(_sort_opts[_sort_label], descending=True, nulls_last=True)
 
@@ -842,6 +859,49 @@ with t_owners:
         mime="text/csv",
     )
 
+    # ── Portfolio equity leaders (live, from the current filtered leads) ──────
+    st.markdown("---")
+    st.markdown("##### 💰 Portfolio equity leaders")
+    st.caption(
+        "Owners with the most total estimated equity across the *currently filtered* "
+        "leads — prime candidates for a single bulk / portfolio offer."
+    )
+    portfolio = (
+        filtered.group_by("owner_norm")
+        .agg(
+            pl.col("owner_name").first().alias("owner"),
+            pl.len().alias("parcels"),
+            pl.col("county_name").n_unique().alias("counties"),
+            pl.col("just_value").sum().alias("total_value"),
+            pl.col("est_equity").sum().alias("total_equity"),
+            pl.col("opportunity_score").mean().round(0).cast(pl.Int64).alias("avg_opportunity"),
+        )
+        .filter(pl.col("parcels") >= 2)
+        .sort("total_equity", descending=True, nulls_last=True)
+        .drop("owner_norm")
+    )
+    if portfolio.is_empty():
+        st.info("No owner holds 2+ parcels in the current filter — loosen the sidebar.")
+    else:
+        st.dataframe(
+            portfolio.head(200),
+            use_container_width=True, height=420, hide_index=True,
+            column_config={
+                "owner": st.column_config.TextColumn("Owner", width="medium"),
+                "parcels": st.column_config.NumberColumn("Parcels", format="%d"),
+                "counties": st.column_config.NumberColumn("Counties", format="%d"),
+                "total_value": st.column_config.NumberColumn("Total value", format="$%d"),
+                "total_equity": st.column_config.NumberColumn("Total equity", format="$%d"),
+                "avg_opportunity": st.column_config.ProgressColumn(
+                    "Avg opportunity", min_value=0, max_value=100, format="%d"),
+            },
+        )
+        st.download_button(
+            "⬇️ Download portfolio leaders",
+            safe_csv(portfolio),
+            file_name="portfolio_equity_leaders.csv", mime="text/csv",
+        )
+
 with t_addr:
     st.markdown("##### Mailing-address clusters")
     st.caption(
@@ -948,7 +1008,12 @@ with t_lookup:
             _offer = max(0, round(0.70 * (row["just_value"] or 0) - repair_est))
             e3.metric("Offer ceiling", fmt_money(_offer),
                       help="70% of just-value − your repair estimate.")
-            e4.metric("First seen", row.get("first_seen") or "—")
+            _dist = row.get("owner_distance_mi")
+            e4.metric("Owner distance", f"{int(_dist):,} mi" if _dist is not None else "—",
+                      help="Owner mailing address → property.")
+
+            if row.get("lead_summary"):
+                st.info(f"**Why this lead** — {row['lead_summary']}")
 
             owner_col, sale_col = st.columns([1, 1])
 
@@ -1660,6 +1725,17 @@ parcels scoring ≥ 75 are shipped in the data file (~41k leads across six count
   equity signal is the known equity % (when a sale exists), 80 when the
   `high_equity_proxy` flag fired, else a neutral 50. Sort the leads table by it
   to surface the leads most likely to pencil as deals.
+
+### Owner distance & "why this lead"
+
+- **Owner mi away** — straight-line miles from the owner's mailing address to the
+  property (zip-centroid haversine). A far-away owner is markedly more motivated;
+  filter with "Owner ≥ N miles away" in the sidebar.
+- **Why this lead** — a plain-English read on each parcel's signals, e.g.
+  *"Out-of-state owner (NY), held 25+ years, PO-box mailing — likely high equity."*
+- **Portfolio equity leaders** (Multi-property owners tab) — owners ranked by
+  total estimated equity across the current filtered leads, to spot bulk-offer
+  candidates.
 
 ### Freshness & dedup
 
