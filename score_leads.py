@@ -480,6 +480,37 @@ def main() -> None:
     print(f"  owner-distance geocoded: {_resolved:,} of {out.height:,}")
     out = add_lead_summary(out)
 
+    # ── Tax-delinquency flag ───────────────────────────────────────────────
+    # Join the county tax-certificate-sale lists from tax_delinquent.py. Only
+    # counties whose tax "Account No." equals the NAL parcel ID match (~18-20
+    # counties); elsewhere the flag is simply absent — unknown, not "current".
+    tax_path = args.output.parent / "tax_delinquent.parquet"
+    if tax_path.exists():
+        tax = pl.read_parquet(tax_path).select("county_name", "parcel_norm", "tax_amount_owed")
+        out = out.with_columns(
+            pl.col("parcel_id").str.replace_all(r"[^0-9A-Za-z]", "").str.to_uppercase()
+            .alias("_pnorm")
+        )
+        out = out.join(
+            tax.rename({"parcel_norm": "_pnorm"}), on=["county_name", "_pnorm"], how="left"
+        ).drop("_pnorm")
+        _delq = pl.col("tax_amount_owed").is_not_null()
+        out = out.with_columns(
+            pl.when(_delq)
+            .then(pl.col("flags") + pl.lit(",tax_delinquent"))
+            .otherwise(pl.col("flags")).alias("flags"),
+            pl.when(_delq)
+            .then(pl.min_horizontal(pl.col("opportunity_score") + 15, pl.lit(100)))
+            .otherwise(pl.col("opportunity_score")).alias("opportunity_score"),
+            pl.when(_delq)
+            .then(pl.col("lead_summary") + pl.lit("  ⚠ Property taxes delinquent."))
+            .otherwise(pl.col("lead_summary")).alias("lead_summary"),
+        )
+        print(f"  tax-delinquent leads flagged: {out.filter(_delq).height:,}")
+    else:
+        out = out.with_columns(pl.lit(None, dtype=pl.Float64).alias("tax_amount_owed"))
+        print("  (no tax_delinquent.parquet — run tax_delinquent.py first; tax flag skipped)")
+
     if args.output.suffix.lower() == ".parquet":
         out.write_parquet(args.output, compression="zstd")
     else:

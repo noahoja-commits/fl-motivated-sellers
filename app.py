@@ -68,6 +68,9 @@ FLAG_DESCRIPTIONS = {
     "bank_trustee": "Owner is a bank, REO, or mortgage trustee (foreclosed assets)",
     "sale_anomaly": "Last sale was <50% or >150% of just value (distressed buy or peak overpayer)",
     "high_equity_proxy": "Bought for <40% of current value, or no sale + 25+ yr old building",
+    "tax_delinquent": "On the county tax-certificate (delinquent property tax) list — "
+                      "the strongest motivation signal. Coverage is partial: ~18-20 "
+                      "counties whose parcel IDs join cleanly; no flag elsewhere ≠ current.",
 }
 
 CRM_COLUMNS = [
@@ -119,6 +122,7 @@ _DOWNCAST = {
     "score": pl.Int16, "opportunity_score": pl.Int16,
     "last_sale_price": pl.Int32, "prior_sale_price": pl.Int32,
     "est_equity": pl.Int32, "owner_distance_mi": pl.Int16,
+    "tax_amount_owed": pl.Float32,
     "living_area": pl.Int32,
     "last_sale_year": pl.Int16, "prior_sale_year": pl.Int16,
     "year_built": pl.Int16, "residential_units": pl.Int16,
@@ -621,6 +625,10 @@ LEAD_COL_CONFIG = {
     "offer_estimate": st.column_config.NumberColumn(
         "Offer (est.)", format="$%d", help="70% of just-value − your repair estimate.",
     ),
+    "tax_amount_owed": st.column_config.NumberColumn(
+        "Tax owed", format="$%d",
+        help="Delinquent property tax owed — from the county tax-certificate list.",
+    ),
     "first_seen": st.column_config.TextColumn("First seen", width="small"),
     "owner_distance_mi": st.column_config.NumberColumn(
         "Owner mi away", format="%d mi",
@@ -654,6 +662,7 @@ with t_leads:
         _sort_opts = {
             "Opportunity": "opportunity_score",
             "Motivation score": "score",
+            "Tax owed": "tax_amount_owed",
             "Offer (est.)": "offer_estimate",
             "Just value": "just_value",
             "Est. equity": "est_equity",
@@ -663,8 +672,9 @@ with t_leads:
         display = filtered.select([
             "opportunity_score", "score", "lead_summary", "county_name", "situs_address",
             "situs_city", "situs_zip", "owner_name", "owner_mailing", "owner_state",
-            "owner_distance_mi", "just_value", "est_equity", "offer_estimate", "year_built",
-            "residential_units", "last_sale_year", "flags", "first_seen", "parcel_id",
+            "owner_distance_mi", "just_value", "est_equity", "offer_estimate",
+            "tax_amount_owed", "year_built", "residential_units", "last_sale_year",
+            "flags", "first_seen", "parcel_id",
         ]).sort(_sort_opts[_sort_label], descending=True, nulls_last=True)
 
         st.dataframe(
@@ -1736,6 +1746,21 @@ parcels scoring ≥ 75 are shipped in the data file (~41k leads across six count
 - **Portfolio equity leaders** (Multi-property owners tab) — owners ranked by
   total estimated equity across the current filtered leads, to spot bulk-offer
   candidates.
+
+### Tax delinquency
+
+- **`tax_delinquent` flag + Tax owed** — parcels on the county's annual
+  tax-certificate (delinquent-property-tax) list. Unpaid property taxes are the
+  strongest motivated-seller signal, so a tax-delinquent lead gets a +15
+  opportunity-score boost and the flag shows in its summary.
+- **Coverage is partial.** The tax-collector lists are pulled from LienHub by
+  `tax_delinquent.py`. They only join to a lead when the county's tax "Account
+  No." equals the NAL parcel ID — true for ~18-20 counties (Pasco, Hernando,
+  Sarasota, Orange, Lee, Broward, Volusia, Lake, and more). Counties like
+  Hillsborough and Pinellas use a separate folio number, so their leads carry
+  **no** `tax_delinquent` flag — that means *unknown*, not *taxes current*.
+- Lists are seasonal (live ~mid-April to the ~June-1 sale); re-run
+  `tax_delinquent.py` then `score_leads.py` to refresh.
 
 ### Freshness & dedup
 
