@@ -89,6 +89,37 @@ def push_one(row: dict[str, Any], base_url: str, token: str, timeout: int = 15) 
         return {"ok": False, "status": 0, "error": f"{type(e).__name__}: {e}"}
 
 
+def fetch_known_parcels(base_url: str, token: str, timeout: int = 20) -> dict[str, Any]:
+    """Fetch the set of parcelIds already in the CRM, for lead deduplication.
+
+    Calls GET <base>/api/parcels. Returns
+    {'ok': bool, 'parcels': set[str], 'count': int, 'error': str|None}.
+    """
+    if not token:
+        return {"ok": False, "parcels": set(), "count": 0, "error": "no token"}
+    try:
+        resp = requests.get(
+            f"{base_url.rstrip('/')}/api/parcels",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=timeout,
+        )
+        if not resp.ok:
+            return {
+                "ok": False, "parcels": set(), "count": 0,
+                "error": f"HTTP {resp.status_code}",
+            }
+        body = resp.json()
+        parcels = {str(p) for p in (body.get("parcelIds") or []) if p}
+        return {"ok": True, "parcels": parcels, "count": len(parcels), "error": None}
+    except requests.exceptions.Timeout:
+        return {"ok": False, "parcels": set(), "count": 0, "error": "timeout"}
+    except Exception as e:
+        return {
+            "ok": False, "parcels": set(), "count": 0,
+            "error": f"{type(e).__name__}: {e}",
+        }
+
+
 def push_batch(
     rows: list[dict[str, Any]],
     base_url: str,

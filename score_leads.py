@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import re
+from datetime import date
 from pathlib import Path
 
 import polars as pl
@@ -211,7 +212,23 @@ def shape_output(df: pl.DataFrame) -> pl.DataFrame:
         + pl.col("OWN_ZIPCD").fill_null("")
     )
 
-    return df.select(
+    # ── Deal math ──────────────────────────────────────────────────────────
+    # est_equity = appraised value − last arm's-length sale price.
+    # A sale price ≤ $1,000 is treated as a non-arm's-length transfer
+    # (quitclaim / nominal deed), so equity is left unknown for those.
+    _arms_length = pl.col("SALE_PRC1") > 1000
+    est_equity = (
+        pl.when(_arms_length)
+        .then(pl.col("JV") - pl.col("SALE_PRC1"))
+        .alias("est_equity")
+    )
+    equity_pct = (
+        pl.when(_arms_length & (pl.col("JV") > 0))
+        .then((pl.col("JV") - pl.col("SALE_PRC1")) / pl.col("JV"))
+        .alias("equity_pct")
+    )
+
+    shaped = df.select(
         pl.col("PARCEL_ID").alias("parcel_id"),
         pl.col("CO_NO").alias("county_code"),
         pl.col("county_name"),
@@ -239,6 +256,27 @@ def shape_output(df: pl.DataFrame) -> pl.DataFrame:
         pl.col("TOT_LVG_AREA").alias("living_area"),
         pl.col("SALE_PRC2").alias("prior_sale_price"),
         pl.col("SALE_YR2").alias("prior_sale_year"),
+        est_equity,
+        equity_pct,
+    )
+
+    # opportunity_score (0–100): blends the motivation score with an equity
+    # signal. equity_signal = the known equity % when a real sale price
+    # exists; else 80 when the high_equity_proxy flag fired (long-held / no
+    # mortgage data — almost certainly high equity); else a neutral 50.
+    # opportunity_score = 0.6·score + 0.4·equity_signal.
+    equity_signal = (
+        pl.when(pl.col("equity_pct").is_not_null())
+        .then((pl.col("equity_pct") * 100).clip(0, 100))
+        .when(pl.col("flags").str.contains("high_equity_proxy"))
+        .then(pl.lit(80.0))
+        .otherwise(pl.lit(50.0))
+    )
+    return shaped.with_columns(
+        (0.6 * pl.col("score") + 0.4 * equity_signal)
+        .round(0)
+        .cast(pl.Int64)
+        .alias("opportunity_score")
     )
 
 
@@ -314,14 +352,39 @@ def main() -> None:
         )
         del scored
         per_county_out.append(out_county)
-        print(f"  {f.name}: {loaded:,} → {flagged:,} flagged → {out_county.height:,} ≥{args.min_score}")
+        print(f"  {f.name}: {loaded:,} -> {flagged:,} flagged -> {out_county.height:,} >={args.min_score}")
 
-    print(f"totals: loaded {grand_loaded:,} → flagged {grand_flagged:,}")
+    print(f"totals: loaded {grand_loaded:,} -> flagged {grand_flagged:,}")
 
     out = pl.concat(per_county_out, how="diagonal_relaxed").sort("score", descending=True)
     print(f"  combined output: {out.height:,} rows")
 
+    # ── New-lead detection ─────────────────────────────────────────────────
+    # Track the first run each parcel_id appeared in. `first_seen` is joined
+    # onto the output so the dashboard can surface fresh inventory; parcels
+    # that drop out of the lead set stay remembered in the snapshot.
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    seen_path = args.output.parent / "seen_parcels.parquet"
+    today = date.today().isoformat()
+    if seen_path.exists():
+        seen = pl.read_parquet(seen_path)
+    else:
+        seen = pl.DataFrame(schema={"parcel_id": pl.Utf8, "first_seen": pl.Utf8})
+
+    out = out.with_columns(pl.col("parcel_id").cast(pl.Utf8))
+    out = out.join(seen, on="parcel_id", how="left").with_columns(
+        pl.col("first_seen").fill_null(today)
+    )
+    new_count = out.filter(pl.col("first_seen") == today).height
+    updated_seen = pl.concat(
+        [seen, out.select("parcel_id", "first_seen")], how="vertical_relaxed"
+    ).unique(subset="parcel_id", keep="first")
+    updated_seen.write_parquet(seen_path, compression="zstd")
+    print(
+        f"  new leads this run: {new_count:,}  "
+        f"(seen-parcel snapshot: {updated_seen.height:,})"
+    )
+
     if args.output.suffix.lower() == ".parquet":
         out.write_parquet(args.output, compression="zstd")
     else:

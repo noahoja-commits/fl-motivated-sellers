@@ -1,10 +1,15 @@
 __pycache__/
 *.pyc
 .venv/
+.venv312/
 venv/
 .DS_Store
 .vscode/
 .streamlit/secrets.toml
 streamlit.log
 score_run.log
+server.log
+server.err
+launch-fl.ps1
+launch-fl.vbs
 data/skip_trace_cache.parquet

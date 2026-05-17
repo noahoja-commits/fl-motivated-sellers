@@ -1,0 +1,8 @@
+.venv312/
+__pycache__/
+*.log
+server.log
+server.err
+.git/
+launch-fl.ps1
+launch-fl.vbs

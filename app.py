@@ -1,5 +1,6 @@
 """Florida Motivated-Sellers Dashboard."""
 
+import json
 import re
 from pathlib import Path
 from urllib.parse import quote_plus
@@ -115,8 +116,9 @@ def to_mail_merge_csv(df: pl.DataFrame) -> str:
 # just_value is deliberately left Int64 — it gets .sum()'d across 218k rows
 # (KPI strip, Map, owner leaderboard) and Int32 could overflow that total.
 _DOWNCAST = {
-    "score": pl.Int16,
+    "score": pl.Int16, "opportunity_score": pl.Int16,
     "last_sale_price": pl.Int32, "prior_sale_price": pl.Int32,
+    "est_equity": pl.Int32,
     "living_area": pl.Int32,
     "last_sale_year": pl.Int16, "prior_sale_year": pl.Int16,
     "year_built": pl.Int16, "residential_units": pl.Int16,
@@ -269,6 +271,14 @@ for k, v in _STATE_DEFAULTS.items():
 # Star/shortlist state — session-only, exportable as CSV
 st.session_state.setdefault("starred_parcels", set())
 
+# Saved searches — session-only, exportable as JSON
+st.session_state.setdefault("saved_searches", {})
+# Deal-math / freshness / dedup widget state
+st.session_state.setdefault("f_repair_est", 30_000)
+st.session_state.setdefault("f_new_only", False)
+st.session_state.setdefault("f_hide_crm", False)
+st.session_state.setdefault("f_sort", "Opportunity")
+
 _require_from_url = set(_qp_csv("require"))
 _exclude_from_url = set(_qp_csv("exclude"))
 for flag in FLAG_DESCRIPTIONS:
@@ -321,6 +331,29 @@ with st.sidebar:
             help="Owner is an LLC, trust, or other entity (not an individual).",
         )
 
+    with st.expander("💰 Deal math"):
+        repair_est = st.number_input(
+            "Repair estimate ($)", min_value=0, max_value=500_000, step=5_000,
+            key="f_repair_est",
+            help="Subtracted from the 70%-of-value offer ceiling. Tune to your typical rehab.",
+        )
+        st.caption(
+            "Offer ceiling = 70% × just-value − repair estimate. A starting "
+            "max-offer reference for absentee/equity deals — FL just-value "
+            "approximates market, not ARV, so treat it as a ballpark."
+        )
+
+    with st.expander("🆕 Freshness & dedup"):
+        new_only = st.checkbox(
+            "New since last refresh", key="f_new_only",
+            help="Show only parcels first seen in the most recent data refresh.",
+        )
+        hide_crm_dupes = st.checkbox(
+            "Hide leads already in CRM", key="f_hide_crm",
+            help="Cross-checks acquisitions-crm and hides parcels already captured. "
+                 "Needs the CAPTURE_TOKEN set below.",
+        )
+
     st.markdown("---")
 
     # ── Shareable filter URL ──────────────────────────────────────────────────
@@ -359,6 +392,69 @@ with st.sidebar:
             st.caption("Append this to the dashboard URL — opens with the same filters preloaded:")
             st.code(f"?{qs}", language=None)
 
+    # ── Saved searches ────────────────────────────────────────────────────────
+    def _apply_saved_search(payload: dict) -> None:
+        """on_click callback — write a saved filter dict back into widget state."""
+        st.session_state["f_counties"] = (
+            payload.get("counties", "").split(",") if payload.get("counties") else []
+        )
+        st.session_state["f_min_score"] = int(payload.get("min_score", 75))
+        st.session_state["f_value_range"] = (
+            int(payload.get("vmin", _VMIN_DEFAULT)),
+            int(payload.get("vmax", _VMAX_DEFAULT)),
+        )
+        for sk, qk in [
+            ("f_multifamily", "multifamily"), ("f_recent_buyer", "recent_buyer"),
+            ("f_pre_1980", "pre_1980"), ("f_entity_only", "entity_only"),
+        ]:
+            st.session_state[sk] = qk in payload
+        _req = set((payload.get("require") or "").split(","))
+        _exc = set((payload.get("exclude") or "").split(","))
+        for _flag in FLAG_DESCRIPTIONS:
+            st.session_state[f"req_{_flag}"] = _flag in _req
+            st.session_state[f"exc_{_flag}"] = _flag in _exc
+
+    with st.expander("💾 Saved searches"):
+        _saved = st.session_state["saved_searches"]
+        _new_name = st.text_input(
+            "Name this search", key="_save_name",
+            placeholder="e.g. Out-of-state Polk pre-1980",
+        )
+        if st.button(
+            "Save current filters", use_container_width=True,
+            disabled=not _new_name.strip(),
+        ):
+            _saved[_new_name.strip()] = _current_qp()
+            st.success(f"Saved “{_new_name.strip()}”.")
+        if _saved:
+            st.caption("Click a name to apply it:")
+            for _name, _payload in list(_saved.items()):
+                _ca, _cd = st.columns([4, 1])
+                _ca.button(
+                    _name, key=f"_apply_{_name}", use_container_width=True,
+                    on_click=_apply_saved_search, args=(_payload,),
+                )
+                if _cd.button("🗑", key=f"_del_{_name}", help=f"Delete “{_name}”"):
+                    del _saved[_name]
+                    st.rerun()
+            st.download_button(
+                "⬇️ Export saved searches",
+                json.dumps(_saved, indent=2),
+                file_name="saved_searches.json", mime="application/json",
+                use_container_width=True,
+            )
+        _ss_upload = st.file_uploader("Restore from JSON", type="json", key="_ss_upload")
+        if _ss_upload is not None:
+            try:
+                _loaded = json.loads(_ss_upload.getvalue())
+                if isinstance(_loaded, dict):
+                    _saved.update(_loaded)
+                    st.success(f"Loaded {len(_loaded)} saved search(es).")
+                else:
+                    st.error("That file isn't a saved-searches export.")
+            except Exception as _e:
+                st.error(f"Couldn't read that file: {_e}")
+
     st.markdown("### CRM push")
     default_token = ""
     default_url = crm_push.DEFAULT_BASE_URL
@@ -382,6 +478,24 @@ with st.sidebar:
     crm_ready = bool(crm_token.strip())
     if not crm_ready:
         st.caption("Paste a token above to enable push-to-CRM buttons.")
+
+
+# ── Derived filter inputs (freshness + CRM dedup) ───────────────────────────
+_latest_seen = leads["first_seen"].max() if "first_seen" in leads.columns else None
+
+
+@st.cache_data(ttl=600, show_spinner="Checking CRM for duplicates…")
+def cached_known_parcels(base_url: str, token: str) -> frozenset:
+    """Cached set of parcelIds already in the CRM (refreshes every 10 min)."""
+    res = crm_push.fetch_known_parcels(base_url, token)
+    return frozenset(res["parcels"]) if res.get("ok") else frozenset()
+
+
+_crm_known: frozenset = frozenset()
+if hide_crm_dupes and crm_token.strip():
+    _crm_known = cached_known_parcels(crm_base_url, crm_token)
+    if not _crm_known:
+        st.sidebar.caption("⚠️ Couldn't reach the CRM — dedup skipped.")
 
 
 def apply_filters(df: pl.DataFrame) -> pl.DataFrame:
@@ -416,10 +530,22 @@ def apply_filters(df: pl.DataFrame) -> pl.DataFrame:
         )
     if entity_only:
         out = out.filter(pl.col("is_entity"))
+    if new_only and _latest_seen is not None and "first_seen" in out.columns:
+        out = out.filter(pl.col("first_seen") == _latest_seen)
+    if hide_crm_dupes and _crm_known:
+        out = out.filter(~pl.col("parcel_id").is_in(list(_crm_known)))
     return out
 
 
 filtered = apply_filters(leads)
+# Live deal math — offer ceiling = 70% of just-value minus the repair estimate.
+filtered = filtered.with_columns(
+    (0.70 * pl.col("just_value") - repair_est)
+    .round(0)
+    .clip(lower_bound=0)
+    .cast(pl.Int64)
+    .alias("offer_estimate")
+)
 
 # ── KPI strip ──────────────────────────────────────────────────────────────────
 def fmt_money(n: int | float) -> str:
@@ -433,12 +559,18 @@ def fmt_money(n: int | float) -> str:
     return f"${n:,}"
 
 
+_new_count = (
+    filtered.filter(pl.col("first_seen") == _latest_seen).height
+    if _latest_seen is not None and "first_seen" in filtered.columns
+    else 0
+)
+
 kpi_html = f"""
 <div class="kpi-row">
   <div class="kpi-card">
     <div class="kpi-label">Leads</div>
     <div class="kpi-value">{filtered.height:,}</div>
-    <div class="kpi-sub">filtered of {leads.height:,}</div>
+    <div class="kpi-sub">filtered of {leads.height:,} · 🆕 {_new_count:,} new</div>
   </div>
   <div class="kpi-card">
     <div class="kpi-label">Total value</div>
@@ -470,6 +602,17 @@ t_leads, t_owners, t_addr, t_lookup, t_starred, t_analytics, t_map, t_about = st
 
 LEAD_COL_CONFIG = {
     "score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%d"),
+    "opportunity_score": st.column_config.ProgressColumn(
+        "Opportunity", min_value=0, max_value=100, format="%d",
+        help="Blend of motivation score + equity signal.",
+    ),
+    "est_equity": st.column_config.NumberColumn(
+        "Est. equity", format="$%d", help="Just-value − last sale price (when a sale exists).",
+    ),
+    "offer_estimate": st.column_config.NumberColumn(
+        "Offer (est.)", format="$%d", help="70% of just-value − your repair estimate.",
+    ),
+    "first_seen": st.column_config.TextColumn("First seen", width="small"),
     "county_name": st.column_config.TextColumn("County", width="small"),
     "situs_address": st.column_config.TextColumn("Address", width="medium"),
     "situs_city": st.column_config.TextColumn("City", width="small"),
@@ -492,11 +635,20 @@ with t_leads:
     if filtered.is_empty():
         st.info("No leads match these filters. Loosen the sidebar.")
     else:
+        _sort_opts = {
+            "Opportunity": "opportunity_score",
+            "Motivation score": "score",
+            "Offer (est.)": "offer_estimate",
+            "Just value": "just_value",
+            "Est. equity": "est_equity",
+        }
+        _sort_label = st.selectbox("Sort by", list(_sort_opts), key="f_sort")
         display = filtered.select([
-            "score", "county_name", "situs_address", "situs_city", "situs_zip",
-            "owner_name", "owner_mailing", "owner_state", "just_value",
-            "year_built", "residential_units", "last_sale_year", "flags", "parcel_id",
-        ]).sort("score", descending=True)
+            "opportunity_score", "score", "county_name", "situs_address",
+            "situs_city", "situs_zip", "owner_name", "owner_mailing", "owner_state",
+            "just_value", "est_equity", "offer_estimate", "year_built",
+            "residential_units", "last_sale_year", "flags", "first_seen", "parcel_id",
+        ]).sort(_sort_opts[_sort_label], descending=True, nulls_last=True)
 
         st.dataframe(
             display,
@@ -787,6 +939,16 @@ with t_lookup:
             c2.metric("Just value", fmt_money(row["just_value"]))
             c3.metric("Year built", row["year_built"] or "—")
             c4.metric("Living area", f"{int(row['living_area'] or 0):,} sf" if row["living_area"] else "—")
+
+            e1, e2, e3, e4 = st.columns(4)
+            e1.metric("Opportunity", row.get("opportunity_score") or row["score"])
+            _eq = row.get("est_equity")
+            e2.metric("Est. equity", fmt_money(_eq) if _eq is not None else "—",
+                      help="Just-value − last sale price (blank when no sale on file).")
+            _offer = max(0, round(0.70 * (row["just_value"] or 0) - repair_est))
+            e3.metric("Offer ceiling", fmt_money(_offer),
+                      help="70% of just-value − your repair estimate.")
+            e4.metric("First seen", row.get("first_seen") or "—")
 
             owner_col, sale_col = st.columns([1, 1])
 
@@ -1485,6 +1647,32 @@ parcels scoring ≥ 75 are shipped in the data file (~41k leads across six count
 - **Multifamily only** — units ≥ 2 or DOR use code 003 / 008 / 009
 - **Recent buyer underwater** — bought in last 4 yrs at ≥ today's just value
 - **Pre-1980 build + 25+ yr held** — deferred-maintenance proxy
+
+### Deal math
+
+- **Est. equity** — just-value minus the last arm's-length sale price. Blank when
+  there's no sale on file (most long-held leads) — equity is then unknown but
+  usually high.
+- **Offer (est.)** — `70% × just-value − repair estimate`. A starting max-offer
+  ceiling; set the repair estimate in the sidebar. FL just-value approximates
+  market value (not ARV), so treat it as a ballpark.
+- **Opportunity** — `0.6 × motivation score + 0.4 × equity signal`, where the
+  equity signal is the known equity % (when a sale exists), 80 when the
+  `high_equity_proxy` flag fired, else a neutral 50. Sort the leads table by it
+  to surface the leads most likely to pencil as deals.
+
+### Freshness & dedup
+
+- **First seen** — the data refresh a parcel first appeared in. "New since last
+  refresh" filters to the most recent batch.
+- **Hide leads already in CRM** — cross-checks `acquisitions-crm` (via
+  `GET /api/parcels`) and hides parcels you've already captured, so you only
+  work fresh leads. Needs the CAPTURE_TOKEN set.
+
+### Saved searches
+
+Name and save the current filter set, then re-apply it in one click. Export all
+saved searches to a JSON file and re-upload it to restore them on another device.
 
 ### Skip trace
 
